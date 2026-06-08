@@ -177,11 +177,11 @@ The result is a single static binary. Put `target/release/tach` on your `PATH`.
 | `tach check [file]` | Type- and effect-check; `--json` for the machine view |
 | `tach run [file]` | Run the project's `main` |
 | `tach test [filter]` | Run tests (blocked while the project has errors) |
-| `tach fix` | Run the agentic repair loop to green (`--strategy`, `--dry-run`) |
+| `tach fix` | Run the agentic repair loop to green (`--strategy`, `--dry-run`, `--coder fixture`) |
 | `tach race` | Race repair strategies in isolation; `--apply` the winner |
 | `tach trace` | Show the last fix/race run (`--json`) |
 | `tach replay` | Re-run the last loop and prove it reproduces |
-| `tach bench` | Report agent-loop metrics (time-to-green, laps, …) |
+| `tach bench` | Report agent-loop metrics (time-to-green, laps, …); `--suite <dir>` over a corpus |
 | `tach audit [file]` | Show every function's effect surface |
 
 ## A taste of the language
@@ -233,15 +233,21 @@ The design notes are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## What's real, and what's next
 
-**Real today:** the language runs; the checker finds effect/type/import bugs and emits
-machine-applicable patches; the typed-patch pipeline enforces scope, effects, and
-regressions; the deterministic loop drives the demo to green; race / trace / replay /
-bench / audit all work; 11 passing tests plus an end-to-end check in CI.
+**Real today:** the language runs — records, `Result`, effects, and user-defined sum
+types with `match`; the checker finds effect, type, import, field, and exhaustiveness
+bugs and emits machine-applicable patches (including did-you-mean renames and an
+insert-the-missing-arm fix for non-exhaustive matches); the typed-patch pipeline enforces
+scope, effects, and regressions; the deterministic loop drives the demo to green;
+`tach bench --suite corpus` benchmarks the loop over a suite of broken projects, one per
+diagnostic family. There's a pluggable coder seam (`tach fix --coder fixture`) for the
+cases structured repair can't reach — a logic bug — whose proposals still go through the
+exact same verification pipeline. 26 passing tests plus an end-to-end check in CI.
 
-**Deliberately scoped out of v0:** native/LLVM codegen (today it interprets), a borrow
-checker, a package manager, and a model-backed coder for logic bugs that structured
-repair can't reach (the loop has the seam for it — `tach fix --model …` — but the core
-demo is intentionally model-free so it's fully reproducible offline).
+**Deliberately scoped out:** native/LLVM codegen (today it interprets), a borrow checker,
+a package manager, and a *model-backed* coder. The loop already has the seam — a `Coder`
+trait, exercised offline by a deterministic fixture coder — so a real model slots in
+behind a flag later. The core demo and the whole test suite stay model-free, so
+everything is fully reproducible offline.
 
 ## Testing
 

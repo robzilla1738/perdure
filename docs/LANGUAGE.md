@@ -39,6 +39,15 @@ type Session = {
 Record types. Field types may themselves be records, named types, or generics like
 `Result<T, E>`.
 
+A `type` can also declare a **sum type** — a set of payload-less variants joined by `|`:
+
+```tach
+type Parity = Even | Odd
+```
+
+Each variant is a value of that type (`Even`, `Odd`), variants compare with `==`, and a
+`match` (see below) selects on them. A field can hold an enum just like any named type.
+
 ### `fn`
 
 ```tach
@@ -89,6 +98,24 @@ access (`r.field`), calls (`f(a, b)`), method calls (`r.method(a)`), and the ope
 The `?` operator unwraps `Ok(v)` to `v` and short-circuits an `Err` out of the current
 function — the same propagation you know from Rust.
 
+### `match`
+
+A `match` selects an arm by the scrutinee's variant; `_` is a catch-all. Each arm is
+`pattern => expression`, and the `match` evaluates to the chosen arm's value:
+
+```tach
+fn describe(p: Parity) -> String {
+  return match p {
+    Even => "even"
+    Odd => "odd"
+  }
+}
+```
+
+A `match` on an enum must cover every variant (or use `_`); the checker offers a patch to
+add any missing arm. Naming a variant the enum doesn't declare is an error with a
+did-you-mean suggestion.
+
 ## Builtin modules and effects
 
 Calling a builtin module member performs an **effect**, which the enclosing function must
@@ -121,5 +148,12 @@ byte-identical results, and what makes the agent-loop metrics trustworthy.
 | `E0421` | `effect_undeclared` | add/extend the `effects [...]` clause |
 | `E0450` | `effect_unused` (warning) | trim effects the function doesn't perform |
 | `E0309` | `type_mismatch` | correct the annotation, or convert the value |
+| `E0330` | `unknown_field` | rename to the nearest field (did-you-mean) |
+| `E0340` | `non_exhaustive_match` | insert an arm for each missing variant |
+| `E0341` | `unknown_variant` | rename to the nearest variant (did-you-mean) |
+| `E0460` | `unused_import` (warning) | remove the unused `import` line |
+| `E0461` | `unused_variable` (warning) | prefix the binding with `_` |
 
-Each carries a `preferred_patch` so `tach fix` can apply it without guessing.
+Each carries a `preferred_patch` so `tach fix` can apply it without guessing. The
+did-you-mean diagnostics only suggest a rename when a real name is a small edit away —
+they never guess wildly, because an agent would dutifully apply a bad rename.
