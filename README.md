@@ -144,8 +144,11 @@ event history
 The goal's `allow` block is **authority, not documentation**: a patch that would write
 outside `src/**`/`tests/**`, or perform an effect the goal was never granted, is rejected
 by the same verification pipeline that runs the tests — *before* it touches disk. The
-runtime is deterministic and offline: the run id is derived from the goal and its source,
-so `resume`, `replay`, and `inspect` are addressable with no clock and no randomness.
+runtime is deterministic and offline: a run's id is a *fingerprint* of the goal and its
+source — no clock, no randomness — so the first run is addressable as a clean `run_<hash>`.
+A fingerprint is not an identity, though: a fresh run of the same goal over the same source
+atomically claims a new, unique id (`run_<hash>-2`, `-3`, …) and can never overwrite a
+prior run's history.
 
 ## Why this is different
 
@@ -382,7 +385,7 @@ checkpoint **without repeating work**; `tach goal replay` proves a run reproduce
 pluggable coder seam (`tach fix --coder fixture`) whose proposals still go through the
 exact same pipeline; `tach fmt` gives one canonical, idempotent style; `tach schema`
 publishes versioned JSON schemas for every machine output; and `tach doctor` /
-`tach explain` round out the toolchain. **41 passing tests** plus two end-to-end checks
+`tach explain` round out the toolchain. **43 passing tests** plus two end-to-end checks
 (red→green, and crash→resume→replay) and a schema-validation step in CI.
 
 **Near-term follow-ups (the roadmap the runtime is built for):** receipts + idempotency
@@ -402,7 +405,7 @@ model-free, so everything is fully reproducible offline.
 ## Testing
 
 ```console
-$ cargo test               # unit + integration tests (41)
+$ cargo test               # unit + integration tests (43)
 $ bash scripts/e2e.sh      # new → check → fix → test demo, asserts green
 $ bash scripts/goal_e2e.sh # goal run → crash → resume → replay, asserts no repeated work
 ```
