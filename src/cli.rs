@@ -296,7 +296,7 @@ fn cmd_test(rest: &[String]) -> i32 {
 }
 
 fn cmd_fix(rest: &[String]) -> i32 {
-    let p = parse(rest, &["--max-laps", "--strategy"]);
+    let p = parse(rest, &["--max-laps", "--strategy", "--coder", "--fixtures"]);
     let dry = p.has("--dry-run");
     let max = p
         .get("--max-laps")
@@ -319,7 +319,34 @@ fn cmd_fix(rest: &[String]) -> i32 {
         println!("  {} no .tach files found here", term::dim("·"));
         return 1;
     }
-    let outcome = agent::fix(ws, strat, max);
+    // An optional coder engages only where deterministic repair gives up. The
+    // only coder built in is the offline `fixture` one, which replays typed
+    // patches from a JSON file through the same verification pipeline.
+    let coder = match p.get("--coder") {
+        Some("fixture") | None if p.has("--coder") => {
+            let path = p.get("--fixtures").unwrap_or(".tach/fixtures.json");
+            match load_fixture_coder(Path::new(path)) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    eprintln!("{} {}: {}", term::bold_red("error:"), path, e);
+                    return 1;
+                }
+            }
+        }
+        Some(other) => {
+            eprintln!(
+                "{} unknown coder `{}` (only `fixture` is built in)",
+                term::bold_red("error:"),
+                other
+            );
+            return 1;
+        }
+        None => None,
+    };
+    let outcome = match &coder {
+        Some(c) => agent::fix_with_coder(ws, strat, max, Some(c as &dyn agent::Coder)),
+        None => agent::fix(ws, strat, max),
+    };
     print!("{}", render::fix(&outcome));
     let _ = trace::save(&root, &TraceFile::Fix(outcome.clone()));
 
@@ -507,6 +534,17 @@ fn cmd_bench(rest: &[String]) -> i32 {
     0
 }
 
+/// Build a deterministic fixture coder from a JSON file of typed patches. The
+/// schema is a plain array of `Patch` objects (the same shape `tach check
+/// --json` emits per diagnostic), so a model — or a human — can author a fix
+/// table the offline loop replays through the verification pipeline.
+fn load_fixture_coder(path: &Path) -> Result<agent::FixtureCoder, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let patches: Vec<crate::patch::Patch> =
+        serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    Ok(agent::FixtureCoder::new(patches))
+}
+
 fn cmd_bench_suite(dir: &Path, max: usize, json: bool) -> i32 {
     let cases = match project::load_suite(dir) {
         Ok(c) => c,
@@ -658,7 +696,7 @@ fn print_help() {
     );
     cmd(
         "fix",
-        "run the agentic repair loop to green (--strategy, --dry-run)",
+        "run the agentic repair loop to green (--strategy, --dry-run, --coder fixture)",
     );
     cmd(
         "race",
@@ -668,7 +706,7 @@ fn print_help() {
     cmd("replay", "re-run the last loop and prove it reproduces");
     cmd(
         "bench",
-        "report agent-loop metrics (time-to-green, laps, ...)",
+        "report agent-loop metrics (time-to-green, laps, ...); --suite <dir>",
     );
     cmd("audit [file]", "show every function's effect surface");
     cmd("version", "print the version");
