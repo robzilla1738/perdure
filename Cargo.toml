@@ -1,0 +1,25 @@
+[package]
+name = "tach"
+version = "0.1.0"
+edition = "2021"
+description = "Tach — the fast language for coding agents. Prompt-to-passing-tests at compiled speed."
+license = "MIT"
+authors = ["Robert"]
+
+[[bin]]
+name = "tach"
+path = "src/main.rs"
+
+[lib]
+name = "tach"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
