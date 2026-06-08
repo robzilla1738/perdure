@@ -166,11 +166,15 @@ pub fn list_runs(repo: &Path) -> Vec<String> {
     ids
 }
 
-/// A deterministic, offline run id derived from the goal name and the exact base
-/// source it starts from. No clock, no randomness — the same goal over the same
-/// code always gets the same id, which is what makes replay and resume
-/// addressable without bookkeeping.
-pub fn derive_run_id(goal: &str, base: &BTreeMap<String, String>) -> String {
+/// A deterministic, offline *fingerprint* of a goal and the exact source it
+/// starts from. No clock, no randomness — the same goal over the same code always
+/// fingerprints the same, which is what makes a run human-recognizable and keeps
+/// the first run of a goal addressable as the clean `run_<hash>`.
+///
+/// A fingerprint is **not** a run id. Two separate runs of the same goal over the
+/// same source are distinct events in history and must not share an identity; see
+/// [`allocate_run`], which turns a fingerprint into a unique, collision-free id.
+pub fn fingerprint(goal: &str, base: &BTreeMap<String, String>) -> String {
     // FNV-1a over a stable serialization of (goal, files).
     let mut h: u64 = 0xcbf29ce484222325;
     let mut mix = |bytes: &[u8]| {
@@ -188,4 +192,40 @@ pub fn derive_run_id(goal: &str, base: &BTreeMap<String, String>) -> String {
         mix(&[0]);
     }
     format!("run_{:016x}", h)
+}
+
+/// The run ids already present in the store that belong to a given fingerprint —
+/// i.e. the prior runs of the same goal over the same source. Used to warn the
+/// operator that starting a fresh run will not touch those histories.
+pub fn runs_for_fingerprint(repo: &Path, fingerprint: &str) -> Vec<String> {
+    list_runs(repo)
+        .into_iter()
+        .filter(|id| id == fingerprint || id.starts_with(&format!("{}-", fingerprint)))
+        .collect()
+}
+
+/// Atomically claim a fresh, unique run directory for a new run, and return its
+/// id. The first run of a fingerprint gets the clean `run_<hash>`; each subsequent
+/// run gets `run_<hash>-2`, `run_<hash>-3`, … The claim is the directory itself:
+/// `create_dir` fails if it already exists, so two processes racing to start the
+/// same goal can never be handed the same id, and an existing run's history is
+/// never reused or overwritten.
+pub fn allocate_run(repo: &Path, fingerprint: &str) -> io::Result<String> {
+    fs::create_dir_all(goals_root(repo))?;
+    for n in 1u64..=1_000_000 {
+        let id = if n == 1 {
+            fingerprint.to_string()
+        } else {
+            format!("{}-{}", fingerprint, n)
+        };
+        match fs::create_dir(run_dir(repo, &id)) {
+            Ok(()) => return Ok(id),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique run id (too many runs of this goal)",
+    ))
 }

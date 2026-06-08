@@ -77,12 +77,16 @@ pub struct EventLog {
 }
 
 impl EventLog {
-    /// Open a fresh log, truncating any prior file. Used when a run first starts.
+    /// Open a fresh log for a run that is just starting. Uses `create_new`, so it
+    /// **refuses to clobber** an existing history: a fresh run must land on a fresh
+    /// path. Run ids are allocated to be unique (see `store::allocate_run`), so in
+    /// normal operation this always succeeds; the refusal is the last line of
+    /// defense against ever overwriting the durable record.
     pub fn create(path: &Path, run_id: &str) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, b"")?;
+        OpenOptions::new().write(true).create_new(true).open(path)?;
         Ok(EventLog {
             path: path.to_path_buf(),
             run_id: run_id.to_string(),

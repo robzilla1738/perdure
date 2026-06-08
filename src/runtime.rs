@@ -131,7 +131,11 @@ pub fn start_run(
     strategy: Strategy,
     crash_after: Option<u64>,
 ) -> io::Result<RunResult> {
-    let run_id = store::derive_run_id(&spec.name, &base.files);
+    // A fingerprint identifies the *goal over this source*; a run id identifies
+    // *this run instance*. Allocating from the fingerprint guarantees a fresh run
+    // never collides with — or overwrites — a previous run's durable history.
+    let fingerprint = store::fingerprint(&spec.name, &base.files);
+    let run_id = store::allocate_run(repo, &fingerprint)?;
     let record = GoalRecord {
         spec: spec.clone(),
         strategy: strategy.label().to_string(),
@@ -601,14 +605,62 @@ mod tests {
     }
 
     #[test]
-    fn run_id_is_deterministic_offline() {
+    fn fingerprint_is_deterministic_offline() {
         let (_, ws) = demo();
-        let a = store::derive_run_id("FixFailingTests", &ws.files);
-        let b = store::derive_run_id("FixFailingTests", &ws.files);
+        let a = store::fingerprint("FixFailingTests", &ws.files);
+        let b = store::fingerprint("FixFailingTests", &ws.files);
         assert_eq!(a, b);
         assert!(a.starts_with("run_"));
-        // A different goal name yields a different id.
-        assert_ne!(a, store::derive_run_id("Other", &ws.files));
+        // A different goal name yields a different fingerprint.
+        assert_ne!(a, store::fingerprint("Other", &ws.files));
+    }
+
+    #[test]
+    fn repeated_runs_get_distinct_ids_and_never_overwrite_history() {
+        // Running the same goal over the same source twice in one store must
+        // produce two distinct runs — the second must not truncate the first's
+        // history. This is the property a real long-horizon runtime depends on.
+        let repo = TempRepo::new("repeat");
+        let (spec1, ws1) = demo();
+        let first = start_run(repo.path(), spec1, ws1, Strategy::Minimal, None).unwrap();
+        let (spec2, ws2) = demo();
+        let second = start_run(repo.path(), spec2, ws2, Strategy::Minimal, None).unwrap();
+
+        // The first run keeps the clean fingerprint id; the second is uniquified.
+        let fp = store::fingerprint("FixFailingTests", &demo().1.files);
+        assert_eq!(first.state.run_id, fp);
+        assert_ne!(first.state.run_id, second.state.run_id);
+        assert!(second.state.run_id.starts_with(&format!("{}-", fp)));
+
+        // Both histories survive independently, each ending in run.completed.
+        for id in [&first.state.run_id, &second.state.run_id] {
+            let events = read_all(&store::events_path(repo.path(), id)).unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| e.kind == kind::PATCH_APPLIED)
+                    .count(),
+                3,
+                "history for {id} is intact"
+            );
+            assert_eq!(events.last().unwrap().kind, kind::RUN_COMPLETED);
+        }
+
+        // The store reports both as runs of the same fingerprint.
+        assert_eq!(store::runs_for_fingerprint(repo.path(), &fp).len(), 2);
+    }
+
+    #[test]
+    fn event_log_create_refuses_to_clobber() {
+        // The last line of defense: even handed a path whose history exists,
+        // EventLog::create must refuse rather than truncate.
+        let repo = TempRepo::new("noclobber");
+        let path = repo.path().join("events.jsonl");
+        let mut log = EventLog::create(&path, "run_x").unwrap();
+        log.append("run.started", serde_json::json!({})).unwrap();
+        assert!(EventLog::create(&path, "run_x").is_err());
+        // The original line is still there.
+        assert_eq!(read_all(&path).unwrap().len(), 1);
     }
 
     #[test]

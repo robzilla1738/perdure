@@ -884,6 +884,31 @@ fn cmd_goal_run(rest: &[String]) -> i32 {
     };
     let spec = GoalSpec::from_decl(decl);
 
+    // A fresh run never overwrites a prior one. If earlier runs of this goal over
+    // this source exist, say so — and point at resume in case one was unfinished.
+    let fp = store::fingerprint(&spec.name, &ws.files);
+    let prior = store::runs_for_fingerprint(&root, &fp);
+    if !prior.is_empty() {
+        println!(
+            "  {} {} prior run(s) of this goal exist; starting a new one (histories are kept)",
+            term::dim("·"),
+            prior.len()
+        );
+        for id in &prior {
+            if let Ok(s) = store::load_state(&root, id) {
+                if matches!(s.status.as_str(), "running" | "budget_exhausted") {
+                    println!(
+                        "    {} `{}` is {} — resume it with `tach goal resume {}`",
+                        term::dim("·"),
+                        id,
+                        s.status,
+                        id
+                    );
+                }
+            }
+        }
+    }
+
     let result = match runtime::start_run(&root, spec, ws, strat, crash_after) {
         Ok(r) => r,
         Err(e) => {
