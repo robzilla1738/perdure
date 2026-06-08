@@ -1,0 +1,3 @@
+test "stop is blocked" {
+  ensure allow(Stop) == false
+}

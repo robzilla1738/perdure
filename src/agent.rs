@@ -621,7 +621,10 @@ test "expired session rejected" {
     #[test]
     fn corpus_all_reaches_green() {
         let cases = corpus_cases();
-        assert!(cases.len() >= 4, "corpus should have several cases");
+        assert!(
+            cases.len() >= 6,
+            "corpus should cover every diagnostic family"
+        );
         let out = run_suite(cases, 16);
         for c in &out.cases {
             assert_eq!(

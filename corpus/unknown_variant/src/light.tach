@@ -1,0 +1,9 @@
+type Signal = Stop | Go
+
+fn allow(s: Signal) -> Bool {
+  return match s {
+    Stop => false
+    Goo => true
+    _ => false
+  }
+}

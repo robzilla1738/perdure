@@ -510,14 +510,181 @@ fn check_expr_fields(
             }
         }
         Expr::Match {
-            scrutinee, arms, ..
+            scrutinee,
+            arms,
+            span,
         } => {
             check_expr_fields(scrutinee, env, unit, reg, sigs, diags);
             for arm in arms {
                 check_expr_fields(&arm.body, env, unit, reg, sigs, diags);
             }
+            let st = infer_expr(scrutinee, env, sigs, reg);
+            check_match(unit, &st, arms, *span, reg, diags);
         }
         Expr::Int(..) | Expr::Float(..) | Expr::Str(..) | Expr::Bool(..) | Expr::Ident(..) => {}
+    }
+}
+
+/// Exhaustiveness + variant checks for a `match` whose scrutinee resolves to a
+/// known enum. Unknown variants get a did-you-mean rename; a non-exhaustive
+/// match gets a patch that inserts the missing arm(s). When the scrutinee type
+/// is anything but a known enum we stay silent (no false positives).
+fn check_match(
+    unit: &Unit,
+    scrutinee_ty: &Type,
+    arms: &[MatchArm],
+    match_span: Span,
+    reg: &TypeRegistry,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let enum_name = match scrutinee_ty {
+        Type::Named(n) if reg.is_enum(n) => n.clone(),
+        _ => return,
+    };
+    let variants = reg.enum_variants(&enum_name).cloned().unwrap_or_default();
+    let mut has_wildcard = false;
+    let mut covered: BTreeSet<String> = BTreeSet::new();
+    for arm in arms {
+        match &arm.pattern {
+            Pattern::Wildcard { .. } => has_wildcard = true,
+            Pattern::Variant { name, span } => {
+                if variants.iter().any(|v| v == name) {
+                    covered.insert(name.clone());
+                } else {
+                    diags.push(unknown_variant_diag(
+                        unit, &enum_name, name, *span, &variants,
+                    ));
+                }
+            }
+        }
+    }
+    if !has_wildcard {
+        let missing: Vec<String> = variants
+            .iter()
+            .filter(|v| !covered.contains(*v))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            diags.push(non_exhaustive_diag(
+                unit, &enum_name, &missing, arms, match_span,
+            ));
+        }
+    }
+}
+
+fn unknown_variant_diag(
+    unit: &Unit,
+    enum_name: &str,
+    variant: &str,
+    name_span: Span,
+    variants: &[String],
+) -> Diagnostic {
+    let mut diag = Diagnostic::error(
+        "E0341",
+        "unknown_variant",
+        format!("enum `{}` has no variant `{}`", enum_name, variant),
+        &unit.source.path,
+        name_span,
+    )
+    .with_note(format!("variants: {}", variants.join(", ")));
+    if let Some(best) = nearest_name(variant, variants) {
+        diag = diag
+            .with_strategies(&["rename_variant"])
+            .with_patch(PreferredPatch {
+                file: unit.source.path.clone(),
+                span: name_span,
+                replacement: best.clone(),
+                rationale: format!("did you mean `{}`?", best),
+            });
+    }
+    diag
+}
+
+fn non_exhaustive_diag(
+    unit: &Unit,
+    enum_name: &str,
+    missing: &[String],
+    arms: &[MatchArm],
+    match_span: Span,
+) -> Diagnostic {
+    let names = missing
+        .iter()
+        .map(|m| format!("`{}`", m))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Underline just the `match` keyword rather than the whole expression.
+    let head = Span::new(match_span.start, match_span.start + "match".len());
+    let mut diag = Diagnostic::error(
+        "E0340",
+        "non_exhaustive_match",
+        format!(
+            "match on `{}` is not exhaustive; missing {}",
+            enum_name, names
+        ),
+        &unit.source.path,
+        head,
+    )
+    .with_strategies(&["add_arm"])
+    .with_note("a match must cover every variant, or use a `_` catch-all arm");
+    if let Some(patch) = insert_arm_patch(unit, arms, missing) {
+        diag = diag.with_patch(patch);
+    }
+    diag
+}
+
+/// Build a patch that appends an arm for each missing variant after the last
+/// existing arm, reusing the first arm's body as a type-correct placeholder the
+/// author then fills in. Indentation is copied from the first arm's line.
+fn insert_arm_patch(unit: &Unit, arms: &[MatchArm], missing: &[String]) -> Option<PreferredPatch> {
+    let first = arms.first()?;
+    let last = arms.last()?;
+    let text = &unit.source.text;
+    let indent = line_indent(text, first.span.start);
+    let bspan = first.body.span();
+    let body = text.get(bspan.start..bspan.end)?;
+    let mut ins = String::new();
+    for m in missing {
+        ins.push('\n');
+        ins.push_str(&indent);
+        ins.push_str(m);
+        ins.push_str(" => ");
+        ins.push_str(body);
+    }
+    Some(PreferredPatch {
+        file: unit.source.path.clone(),
+        span: Span::at(last.span.end),
+        replacement: ins,
+        rationale: format!(
+            "add the missing arm{}: {} (replace the placeholder body)",
+            if missing.len() > 1 { "s" } else { "" },
+            missing.join(", ")
+        ),
+    })
+}
+
+/// The leading whitespace of the line containing `offset`.
+fn line_indent(text: &str, offset: usize) -> String {
+    let off = offset.min(text.len());
+    let start = text[..off].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    text[start..off]
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect()
+}
+
+/// Nearest candidate name to `name` by edit distance, if close enough to be a
+/// plausible typo. Shared by unknown-field and unknown-variant suggestions.
+fn nearest_name(name: &str, candidates: &[String]) -> Option<String> {
+    let mut best: Option<(usize, &str)> = None;
+    for c in candidates {
+        let d = edit_distance(name, c);
+        if best.map_or(true, |(bd, _)| d < bd) {
+            best = Some((d, c.as_str()));
+        }
+    }
+    match best {
+        Some((d, c)) if d > 0 && (d <= 2 || d * 2 <= name.chars().count()) => Some(c.to_string()),
+        _ => None,
     }
 }
 
@@ -1144,6 +1311,58 @@ fn compute(x: Int) -> Int {
         let patch = d.preferred_patch.as_ref().expect("an underscore patch");
         assert_eq!(patch.replacement, "_scratch");
         assert_eq!(&UNUSED_VAR[patch.span.start..patch.span.end], "scratch");
+    }
+
+    const NON_EXHAUSTIVE: &str = "type Signal = Stop | Go\n\nfn allow(s: Signal) -> Bool {\n  return match s {\n    Stop => false\n  }\n}\n";
+
+    #[test]
+    fn non_exhaustive_match_inserts_missing_arm() {
+        let (prog, _) = Program::parse_sources(vec![SourceFile::new("m.tach", NON_EXHAUSTIVE)]);
+        let diags = check_program(&prog);
+        let d = diags
+            .iter()
+            .find(|d| d.kind == "non_exhaustive_match")
+            .expect("a non_exhaustive_match error");
+        assert_eq!(d.code, "E0340");
+        let patch = d.preferred_patch.as_ref().expect("an add-arm patch");
+        // inserts `Go` with the first arm's body as a placeholder, 4-space indent
+        assert_eq!(patch.replacement, "\n    Go => false");
+        // the insertion point is the end of the last existing arm (`Stop => false`)
+        let at = NON_EXHAUSTIVE.find("=> false").unwrap() + "=> false".len();
+        assert_eq!(patch.span.start, at);
+        assert_eq!(patch.span.end, at);
+    }
+
+    const TYPO_VARIANT: &str = "type Signal = Stop | Go\n\nfn allow(s: Signal) -> Bool {\n  return match s {\n    Stop => false\n    Goo => true\n    _ => false\n  }\n}\n";
+
+    #[test]
+    fn unknown_variant_suggests_nearest() {
+        let (prog, _) = Program::parse_sources(vec![SourceFile::new("m.tach", TYPO_VARIANT)]);
+        let diags = check_program(&prog);
+        let d = diags
+            .iter()
+            .find(|d| d.kind == "unknown_variant")
+            .expect("an unknown_variant error");
+        assert_eq!(d.code, "E0341");
+        let patch = d.preferred_patch.as_ref().expect("a rename patch");
+        assert_eq!(patch.replacement, "Go");
+        assert_eq!(&TYPO_VARIANT[patch.span.start..patch.span.end], "Goo");
+        // a wildcard arm is present, so the match is NOT also non-exhaustive.
+        assert!(!diags.iter().any(|d| d.kind == "non_exhaustive_match"));
+    }
+
+    #[test]
+    fn exhaustive_match_is_clean() {
+        const OK: &str = "type Signal = Stop | Go\n\nfn allow(s: Signal) -> Bool {\n  return match s {\n    Stop => false\n    Go => true\n  }\n}\n";
+        let (prog, _) = Program::parse_sources(vec![SourceFile::new("m.tach", OK)]);
+        let diags = check_program(&prog);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.kind == "non_exhaustive_match" || d.kind == "unknown_variant"),
+            "fully-covered match should be clean: {:?}",
+            diags
+        );
     }
 
     #[test]
