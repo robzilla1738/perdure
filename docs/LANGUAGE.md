@@ -184,6 +184,67 @@ recover a crashed run from exactly where it stopped without repeating work, and
 `tach goal replay` reproduces it byte-for-byte. See the architecture notes for the full
 model.
 
+### Plan goals (workflows)
+
+A goal may carry a `plan { ... }` block instead of relying on the repair loop. A plan is a
+small **workflow language** — a goal that *acts*: it calls (offline, deterministic) tools,
+pauses at human approval gates, and branches and loops over tool output. It is the general
+form of the action layer.
+
+```tach
+goal ReconcileChargebacks -> Success {
+  budget { steps: 60 }                       // budget bounds the number of tool calls
+  allow {
+    fake.stripe.list_disputes                // every tool a `call` uses must be granted
+    fake.stripe.refund
+    fake.email.send
+    fake.zendesk.comment
+  }
+  plan {
+    let disputes = call fake.stripe.list_disputes { customer: "cus_42" }
+    for charge in disputes.charges {         // loop over a tool's output list
+      if charge.is_duplicate {               // branch on a field of the output
+        approve "refund the duplicate charge" {   // pause for a human; body runs once granted
+          let refund = call fake.stripe.refund {
+            charge_id: charge.charge_id
+            amount_cents: charge.amount_cents
+          }
+          call fake.email.send { to: "billing@acme.test", charge_id: charge.charge_id }
+        }
+      } else {
+        call fake.zendesk.comment { ticket_id: "zd_dispute", body: "Not a duplicate." }
+      }
+    }
+  }
+}
+```
+
+Plan statements:
+
+| Form | Meaning |
+| --- | --- |
+| `let x = <expr>` | bind (or rebind) a name in the plan's single, flat scope |
+| `let x = call <tool> { k: v, … }` | call a tool and bind its output (a JSON value) |
+| `call <tool> { k: v, … }` | call a tool, discarding the output |
+| `approve "summary" { … }` | human approval gate — the body runs only once `tach goal approve` grants it |
+| `if <cond> { … } else { … }` | branch on a boolean (`else` optional; no truthiness coercion) |
+| `for <x> in <list-expr> { … }` | iterate a JSON array (typically a tool's output) |
+| `while <cond> { … }` | repeat while a boolean holds (bounded by the budget) |
+
+Expressions reuse the ordinary grammar — literals, identifiers, field access (`charge.amount_cents`),
+arithmetic, comparisons, and `&&`/`||`/`!` — evaluated in JSON-value space (the type tools speak).
+`call`/`approve`/`for`/`while`/`in` are contextual keywords, so don't name a variable after them.
+
+Every tool `call` produces a durable **receipt**, and the plan is driven by **re-execution**: a
+run and a resume both walk the plan from the top, and a call whose receipt already exists returns
+its recorded output *without invoking the tool again*. That single rule is what makes loops and
+long-horizon flows crash-safe — a refund inside a loop, crashed right after it commits, is
+replayed for free on resume and never issued twice. `tach goal approvals`/`approve`/`deny` drive
+the gates; `tach goal receipts` lists the effects; `tach goal replay` proves the run reproduces.
+Two plan goals ship built-in: `ReconcileChargebacks` (a `for` loop with a per-duplicate refund
+gate) and `RetryFlakyDeploy` (a `while` retry loop). See the architecture notes for the durable
+interpreter and its exactly-once invariant.
+
 ## Formatting
 
 There is **one formatter**. `tach fmt` renders any file to a single canonical style

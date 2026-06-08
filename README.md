@@ -200,6 +200,60 @@ approval file (`approvals/<id>.json`) is the single source of truth for a gate; 
 call the tools its `allow` block grants. The whole lifecycle is in the log — `action.proposed`,
 `approval.requested`/`granted`, `tool.called`/`completed`, `receipt.created`/`reused`.
 
+## The plan language: loops and long-horizon workflows
+
+The linear action layer runs a fixed list of steps. **The plan language is the general form** —
+a `plan { ... }` block in goal source with real control flow: `let` bindings, tool `call`s,
+`approve` gates, `if`/`else`, and **`for`/`while` loops**. It is built for the long horizon: a
+goal can fetch a list from a tool, loop over it, branch on each item, and pause for approval
+*per iteration* — and survive a crash anywhere without ever repeating a side effect.
+
+```text
+goal ReconcileChargebacks -> Success {
+  budget { steps: 60 }
+  allow { fake.stripe.list_disputes; fake.stripe.refund; fake.email.send; fake.zendesk.comment }
+  plan {
+    let disputes = call fake.stripe.list_disputes { customer: "cus_42" }
+    for charge in disputes.charges {
+      if charge.is_duplicate {
+        approve "refund the duplicate charge" {
+          call fake.stripe.refund { charge_id: charge.charge_id, amount_cents: charge.amount_cents }
+          call fake.email.send   { to: "billing@acme.test", charge_id: charge.charge_id }
+        }
+      } else {
+        call fake.zendesk.comment { ticket_id: "zd_dispute", body: "Reviewed: not a duplicate." }
+      }
+    }
+  }
+}
+```
+
+What makes loops safe is **durable re-execution**: run *and* resume both walk the plan from the
+top, and every tool call is **memoized by its receipt** — reaching a call whose receipt already
+exists returns the recorded output without invoking the tool again. So a loop with two genuine
+duplicates pauses twice (once per refund gate); crash right after the first refund and the
+resume *re-walks* the loop, replays the completed work for free, and lands exactly where it left
+off — the first refund is never repeated.
+
+```console
+$ tach goal run ReconcileChargebacks          # pauses at the FIRST duplicate's refund gate
+$ tach goal approve <id> <apr>                 # grant it
+$ tach goal resume <id> --crash-after step:1   # crash right after the refund is receipted
+  ✗ crashed after step 1 (simulated). State is durable.
+$ tach goal resume <id>                         # refund #1 is memoized, NOT repeated → pauses at the 2nd gate
+$ tach goal approve <id> <apr2> && tach goal resume <id>
+  ✓ goal completed — 6 receipt(s).
+$ tach goal receipts <id>                       # exactly two fake.stripe.refund receipts — one per duplicate
+$ tach goal replay <id>
+  ● replay reproduced the run exactly — 6 step(s), completed
+```
+
+`RetryFlakyDeploy` shows a `while` loop: it retries a flaky deploy until it succeeds (failing on
+attempts 1–2, succeeding on the 3rd — deterministically), then announces it behind an approval
+gate. Resuming a crashed retry loop re-derives the attempt count and never re-runs a deploy that
+already has a receipt. Both goals are built-in and offline; see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+for the interpreter and its exactly-once invariant.
+
 ## Why this is different
 
 Rust made memory safety central. Bun made JS tooling feel instant. Tach makes the
@@ -437,19 +491,26 @@ plan that proposes effectful actions, pauses for human approval (`tach goal appr
 `approve` / `deny`), calls offline **fake tools**, and records a durable **receipt** for every
 effect (`tach goal receipts` / `receipt`). Idempotency keys make it survive crash/resume with
 *no duplicate side effect*, and `tach goal replay` reproduces the effects from the recorded
-approvals. There's a pluggable coder seam (`tach fix --coder fixture`) whose proposals still go
-through the exact same pipeline; `tach fmt` gives one canonical, idempotent style; `tach schema`
-publishes versioned JSON schemas for every machine output (now including `approval` and
-`receipt`); and `tach doctor` / `tach explain` round out the toolchain. **63 passing tests**
-plus end-to-end checks (red→green, crash→resume→replay, and the approval/refund/receipt demo)
-and a schema-validation step in CI.
+approvals. **The plan language is real:** a `plan { ... }` block (`let`/`call`/`approve`/`if`/
+`for`/`while`) drives built-in goals like `ReconcileChargebacks` (a `for` loop with a per-duplicate
+approval gate) and `RetryFlakyDeploy` (a `while` retry loop) through a **durable re-execution
+interpreter** — run and resume re-walk the plan and memoize completed calls by receipt, so loops
+and crashes still produce each effect exactly once, and `tach goal replay` reproduces the run.
+Durable writes are atomic (temp-file + rename), so a crash mid-write can never strand a half-written
+receipt that a resume would mistake for "not yet done." There's a pluggable coder seam
+(`tach fix --coder fixture`) whose proposals still go through the exact same pipeline; `tach fmt`
+gives one canonical, idempotent style; `tach schema` publishes versioned JSON schemas for every
+machine output (including `approval` and `receipt`); and `tach doctor` / `tach explain` round out
+the toolchain. **84 passing tests** plus end-to-end checks (red→green, crash→resume→replay, the
+approval/refund/receipt demo, and the loop/approval/crash plan demo) and a schema-validation step in CI.
 
 **Near-term follow-ups (the roadmap the runtime is built for):** real tool integrations behind
-the fake-tool seam, a scenario DSL for crash/resume/approval tests, typed memory lanes with a
+the fake-tool seam, user-authored plan goals loaded from a workspace (the interpreter already
+runs any parsed `plan` block; only the catalog is built-in today), typed memory lanes with a
 context-drift detector, an existing-repo `Tachfile` mode that wraps Bun/Cargo/Go test commands,
 MCP client/server, and a portable goal ABI. The event log, durable store, authority model, and
-the approval/receipt substrate added here are exactly what those phases hang off. Also:
-multi-file user imports and comment-preserving formatting.
+the approval/receipt substrate are exactly what those phases hang off. Also: multi-file user
+imports and comment-preserving formatting.
 
 **Deliberately scoped out:** native/LLVM codegen (today it interprets), a borrow checker,
 a package manager, an LSP server, and a *model-backed* coder. The loop already has the
@@ -461,13 +522,14 @@ model-free, so everything is fully reproducible offline.
 ## Testing
 
 ```console
-$ cargo test                 # unit + integration tests (63)
+$ cargo test                 # unit + integration tests (84)
 $ bash scripts/e2e.sh        # new → check → fix → test demo, asserts green
 $ bash scripts/goal_e2e.sh   # goal run → crash → resume → replay, asserts no repeated work
 $ bash scripts/action_e2e.sh # approve → crash → resume → replay, asserts exactly one refund
+$ bash scripts/plan_e2e.sh   # plan loop → per-duplicate approval → mid-loop crash → exactly-once
 ```
 
-CI (`.github/workflows/ci.yml`) runs all three on every push, plus `tach fmt --check` and
+CI (`.github/workflows/ci.yml`) runs all four on every push, plus `tach fmt --check` and
 JSON-schema validation. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for notes aimed at
 automated/cloud agents.
 

@@ -34,6 +34,83 @@ pub struct GoalDecl {
     pub budget: GoalBudget,
     pub allow: GoalAllow,
     pub require: GoalRequire,
+    /// The optional `plan { ... }` block: a durable, re-executable workflow of
+    /// tool calls, approval gates, and control flow. When present the goal is an
+    /// *action* goal driven by the plan interpreter rather than the repair loop.
+    pub plan: Option<PlanBlock>,
+    pub span: Span,
+}
+
+/// The body of a `plan { ... }` block — a long-horizon agentic workflow.
+///
+/// Unlike a `fn` body (statically typed, pure computation), plan statements
+/// *orchestrate*: they call (fake, offline) tools, pause at human approval
+/// gates, and branch/loop over tool output. The runtime re-executes the whole
+/// block from the top on every resume, memoizing already-completed calls by
+/// their durable receipt — so loops and crash/resume produce each side effect
+/// exactly once. Expressions reuse the ordinary `Expr` grammar; only the
+/// statement forms (`call`, `approve`, `for`, `while`) are plan-specific.
+#[derive(Clone, Debug)]
+pub struct PlanBlock {
+    pub stmts: Vec<PlanStmt>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub enum PlanStmt {
+    /// `let name = <value>` — bind or rebind a name in the plan's single scope.
+    Let {
+        name: String,
+        name_span: Span,
+        value: PlanValue,
+        span: Span,
+    },
+    /// A bare tool call whose output is discarded, e.g. `call fake.email.send { ... }`.
+    Call { call: PlanCall, span: Span },
+    /// `approve "summary" { body }` — a human approval gate over a sub-plan. The
+    /// body runs only after a `tach goal approve` grants the gate.
+    Approve {
+        summary: String,
+        body: Vec<PlanStmt>,
+        span: Span,
+    },
+    /// `if cond { ... } else { ... }` over a boolean tool/field value.
+    If {
+        cond: Expr,
+        then: Vec<PlanStmt>,
+        els: Option<Vec<PlanStmt>>,
+        span: Span,
+    },
+    /// `for var in <array-expr> { ... }` — iterate a JSON array (typically a tool's output).
+    For {
+        var: String,
+        var_span: Span,
+        iter: Expr,
+        body: Vec<PlanStmt>,
+        span: Span,
+    },
+    /// `while cond { ... }` — repeat while a boolean expression holds (bounded by budget).
+    While {
+        cond: Expr,
+        body: Vec<PlanStmt>,
+        span: Span,
+    },
+}
+
+/// The right-hand side of a plan `let`: either a tool call or a pure expression.
+#[derive(Clone, Debug)]
+pub enum PlanValue {
+    Call(PlanCall),
+    Expr(Expr),
+}
+
+/// A `call <tool> { key: expr, ... }` tool invocation. The `input` fields are
+/// evaluated to a JSON object the runtime feeds to the (fake) tool.
+#[derive(Clone, Debug)]
+pub struct PlanCall {
+    pub tool: String,
+    pub tool_span: Span,
+    pub input: Vec<(String, Expr)>,
     pub span: Span,
 }
 

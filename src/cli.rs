@@ -12,7 +12,7 @@ use crate::patch::Workspace;
 use crate::program::Program;
 use crate::runner::run_tests;
 use crate::trace::{self, TraceFile};
-use crate::{action, builtins, event, fmt, project, render, runtime, schema, store, term};
+use crate::{action, builtins, event, fmt, plan, project, render, runtime, schema, store, term};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -849,6 +849,25 @@ fn cmd_goal_overview() -> i32 {
         }
     }
     println!();
+
+    // Built-in plan goals: durable workflows with control flow (loops, branches,
+    // per-iteration approval gates) written in the Tach plan language.
+    println!("{}", term::bold("built-in plan goals"));
+    println!();
+    for name in plan::builtin_plan_goal_names() {
+        if let Some((spec, _)) = plan::builtin_plan_goal(name) {
+            println!(
+                "  {}  {}",
+                term::bold(name),
+                term::dim(&format!(
+                    "plan workflow · {} tool(s) · budget {} steps",
+                    spec.allow.tools.len(),
+                    spec.step_budget()
+                ))
+            );
+        }
+    }
+    println!();
     println!("  run one with  {}", term::bold("tach goal run <name>"));
     0
 }
@@ -890,6 +909,29 @@ fn cmd_goal_run(rest: &[String]) -> i32 {
         }
         let crash = crash_after.map(runtime::ActionCrash::Step);
         let result = match runtime::start_action_run(&root, spec, plan, crash) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("{} {}", term::bold_red("error:"), e);
+                return 1;
+            }
+        };
+        return finish_run(&root, result, dry);
+    }
+
+    // A built-in plan goal runs a durable workflow (loops/branches/approvals) and
+    // likewise needs no workspace — the plan body is the program.
+    if let Some((spec, plan_block)) = plan::builtin_plan_goal(&name) {
+        let fp = store::fingerprint(&spec.name, &std::collections::BTreeMap::new());
+        let prior = store::runs_for_fingerprint(&root, &fp);
+        if !prior.is_empty() {
+            println!(
+                "  {} {} prior run(s) of this goal exist; starting a new one (histories are kept)",
+                term::dim("·"),
+                prior.len()
+            );
+        }
+        let crash = crash_after.map(runtime::ActionCrash::Step);
+        let result = match runtime::start_plan_run(&root, spec, plan_block, crash) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("{} {}", term::bold_red("error:"), e);
@@ -1037,8 +1079,9 @@ fn finish_run(root: &Path, result: runtime::RunResult, dry: bool) -> i32 {
         return 0;
     }
 
-    // An action goal has no workspace to write back; it proves its work with receipts.
-    if st.kind == "action" {
+    // Action and plan goals have no workspace to write back; they prove their
+    // work with receipts.
+    if st.kind == "action" || st.kind == "plan" {
         return match st.status.as_str() {
             "completed" => {
                 println!(

@@ -158,7 +158,43 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
         fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".into());
-    fs::write(path, json)
+    // Atomic write: stage to a sibling `.tmp` file, then rename into place.
+    // `fs::write` truncates first, so a crash mid-write would otherwise leave a
+    // half-written receipt/approval/state on disk; `read_dir_json` silently skips
+    // an unparseable file, so a resume would read it as "missing" and re-run the
+    // effect — a double side effect. `rename` is atomic, so a reader only ever
+    // sees the whole old file or the whole new one. A crash can at worst leave a
+    // stale `.tmp` behind, which the next write to the same target overwrites.
+    let tmp = tmp_sibling(path);
+    fs::write(&tmp, json)?;
+    atomic_replace(&tmp, path)
+}
+
+/// The deterministic `.tmp` staging path for an atomic write to `path`. No clock
+/// or randomness (the durable store stays replayable): the rename is the atomic
+/// step, and each durable file has a unique target name so its `.tmp` is unique.
+fn tmp_sibling(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".tmp");
+    PathBuf::from(s)
+}
+
+/// Replace `dst` with `tmp` as atomically as the platform allows.
+#[cfg(not(windows))]
+fn atomic_replace(tmp: &Path, dst: &Path) -> io::Result<()> {
+    // POSIX `rename` atomically replaces an existing destination — the ideal case.
+    fs::rename(tmp, dst)
+}
+
+/// Replace `dst` with `tmp`. Windows `rename` refuses to overwrite an existing
+/// file (unlike POSIX), so remove the old one first. The window between the
+/// remove and the rename is not crash-atomic, but a crash there leaves either the
+/// fully-written new file or no file — never a half-written one — which is all the
+/// resume logic needs (a missing receipt is simply re-derived).
+#[cfg(windows)]
+fn atomic_replace(tmp: &Path, dst: &Path) -> io::Result<()> {
+    let _ = fs::remove_file(dst);
+    fs::rename(tmp, dst)
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<T> {

@@ -24,6 +24,7 @@ pub mod interp;
 pub mod lexer;
 pub mod parser;
 pub mod patch;
+pub mod plan;
 pub mod program;
 pub mod project;
 pub mod render;

@@ -14,11 +14,13 @@
 
 use crate::action::{self, ActionPlan};
 use crate::agent::{self, Strategy};
+use crate::ast::{PlanBlock, PlanCall, PlanStmt, PlanValue};
 use crate::event::{kind, EventLog};
 use crate::goal::GoalSpec;
 use crate::patch::{verify_patch, VerifyOpts, Workspace};
+use crate::plan::{self, Env};
 use crate::store::{self, events_path, Approval, Checkpoint, GoalRecord, Receipt, RunState};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
@@ -205,6 +207,9 @@ pub fn resume_run(repo: &Path, run_id: &str, crash_after: Option<u64>) -> io::Re
     if record.kind == "action" {
         // The CLI only exposes step-boundary crashes; the receipt-window hook is test-only.
         return resume_action_run(repo, run_id, crash_after.map(ActionCrash::Step));
+    }
+    if record.kind == "plan" {
+        return resume_plan_run(repo, run_id, crash_after.map(ActionCrash::Step));
     }
     let spec = record.spec;
     let strategy = strategy_from_label(&record.strategy);
@@ -445,6 +450,9 @@ pub fn replay_run(repo: &Path, run_id: &str) -> io::Result<ReplayResult> {
     let record = store::load_goal(repo, run_id)?;
     if record.kind == "action" {
         return replay_action_run(repo, run_id);
+    }
+    if record.kind == "plan" {
+        return replay_plan_run(repo, run_id);
     }
     let recorded = store::load_state(repo, run_id)?;
     let recorded_files = store::load_latest_checkpoint(repo, run_id)
@@ -934,6 +942,758 @@ pub fn replay_action_run(repo: &Path, run_id: &str) -> io::Result<ReplayResult> 
         replayed_status: status,
         identical,
         steps: cursor as u64,
+    })
+}
+
+// ============================================================================
+// Plan-language runtime (durable re-execution)
+// ============================================================================
+//
+// A `plan { ... }` goal is driven by RE-EXECUTING the plan from the top on every
+// run and every resume. The idea that makes loops and long-horizon flows safe:
+// each tool `call` is memoized by its durable receipt. Reaching a call whose
+// receipt already exists returns the recorded output WITHOUT invoking the tool
+// again; reaching an un-granted `approve` pauses the walk; a crash anywhere is
+// recovered by simply walking again. So:
+//
+//   * the receipt write is the commit point — a side effect happens exactly once
+//     even across crashes (and the write is atomic; see `store::write_json`);
+//   * the approval file is the durable truth of a gate (the interpreter only
+//     reads it — the approve/deny CLI command writes granted/denied);
+//   * `state.json` is COSMETIC — control flow is recomputed from the plan + the
+//     receipts/ and approvals/ dirs on every walk, never read back from state.
+//
+// `call_index`/`gate_index` are assigned in WALK ORDER (not at parse time), so a
+// loop's repeated `call` gets a distinct idempotency key per iteration, and the
+// assignment is stable across resume because the walk up to the frontier is
+// deterministic: memoized outputs + recorded approvals + pure fake tools mean
+// every branch taken and every loop count is identical on every walk.
+
+/// A generous internal ceiling on loop-body iterations per walk. The user-facing
+/// budget bounds tool calls; this exists only so a pathological call-free loop
+/// (`while true { let x = 1 }`) fails loudly instead of spinning forever.
+const PLAN_LOOP_LIMIT: u64 = 1_000_000;
+
+/// How a plan walk ends, or why a statement halted it. Anything but `Next`
+/// unwinds the enclosing blocks/loops up to the top of the walk.
+enum Flow {
+    /// Continue to the next statement.
+    Next,
+    /// Hit an un-granted approval gate; the run is paused (healthy, resumable).
+    Pause,
+    /// Hit a denied approval gate (the id is recorded for the run.failed reason).
+    Denied(String),
+    /// A plan-language or tool error.
+    Failed(String),
+    /// The step budget (max tool calls) was exceeded.
+    Budget,
+    /// A simulated `--crash-after` fired; the durable state is intact, resumable.
+    Crash,
+}
+
+/// True when a `--crash-after`/test crash should fire after the `committed`-th
+/// new receipt of this process. Both crash variants mean the same thing for a
+/// plan: stop right after a side effect is durable, before doing anything else.
+fn crash_after_n(crash: Option<ActionCrash>, committed: u64) -> bool {
+    matches!(crash, Some(ActionCrash::Step(n)) | Some(ActionCrash::AfterReceipt(n)) if n == committed)
+}
+
+fn json_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "list",
+        Value::Object(_) => "record",
+    }
+}
+
+/// The first tool a gated body would call, for display in the approval listing.
+fn first_call_tool(stmts: &[PlanStmt]) -> Option<&str> {
+    for s in stmts {
+        let found = match s {
+            PlanStmt::Call { call, .. } => Some(call.tool.as_str()),
+            PlanStmt::Let {
+                value: PlanValue::Call(c),
+                ..
+            } => Some(c.tool.as_str()),
+            PlanStmt::If { then, els, .. } => {
+                first_call_tool(then).or_else(|| els.as_deref().and_then(first_call_tool))
+            }
+            PlanStmt::For { body, .. }
+            | PlanStmt::While { body, .. }
+            | PlanStmt::Approve { body, .. } => first_call_tool(body),
+            PlanStmt::Let { .. } => None,
+        };
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+/// The mutable context threaded through one durable plan walk. None of it is the
+/// durable truth (that is the receipts/approvals dirs); it is rebuilt from
+/// scratch on every walk.
+struct PlanCtx<'a> {
+    repo: &'a Path,
+    run_id: String,
+    spec: &'a GoalSpec,
+    log: &'a mut EventLog,
+    state: RunState,
+    env: Env,
+    /// Tool calls reached so far this walk — the idempotency discriminator and
+    /// what the budget is billed against.
+    call_index: u64,
+    /// Approval gates reached so far this walk.
+    gate_index: u64,
+    /// New receipts committed in THIS process — drives the crash hook. Process-
+    /// local on purpose: it must never be confused with the cosmetic cumulative
+    /// `receipts_created`, which can be stale after a crash between a receipt
+    /// write and the following state save.
+    committed_this_process: u64,
+    /// Receipts already on disk when this walk began (from prior processes).
+    baseline_receipts: u64,
+    /// Loop-body iterations this walk (bounded by `PLAN_LOOP_LIMIT`).
+    loop_iters: u64,
+    crash: Option<ActionCrash>,
+}
+
+impl PlanCtx<'_> {
+    /// Persist the cosmetic head. Counters are derived from the durable receipt
+    /// count + the process-local commit count, never the other way round.
+    fn save(&mut self) -> io::Result<()> {
+        let total = (self.baseline_receipts + self.committed_this_process) as usize;
+        self.state.receipts_created = total;
+        self.state.actions_executed = total;
+        self.state.cursor = self.call_index;
+        // `step` tracks cumulative durable side effects (one per receipt) so the
+        // crash message and `from_step` report real progress, not a stuck 0.
+        self.state.step = total as u64;
+        store::save_state(self.repo, &self.state)
+    }
+
+    fn bump_loop(&mut self) -> Option<Flow> {
+        self.loop_iters += 1;
+        if self.loop_iters > PLAN_LOOP_LIMIT {
+            Some(Flow::Failed(format!(
+                "plan exceeded the loop safety limit of {PLAN_LOOP_LIMIT} iterations"
+            )))
+        } else {
+            None
+        }
+    }
+}
+
+/// The result of executing a `call`: the tool's (possibly memoized) output, or a
+/// halt that must unwind the walk (budget/authority/tool error/crash).
+enum CallOutcome {
+    Output(Value),
+    Halt(Flow),
+}
+
+fn exec_stmts(ctx: &mut PlanCtx, stmts: &[PlanStmt]) -> io::Result<Flow> {
+    for s in stmts {
+        match exec_stmt(ctx, s)? {
+            Flow::Next => {}
+            other => return Ok(other),
+        }
+    }
+    Ok(Flow::Next)
+}
+
+fn exec_stmt(ctx: &mut PlanCtx, s: &PlanStmt) -> io::Result<Flow> {
+    match s {
+        PlanStmt::Let { name, value, .. } => {
+            let v = match value {
+                PlanValue::Call(c) => match exec_call(ctx, c)? {
+                    CallOutcome::Output(v) => v,
+                    CallOutcome::Halt(f) => return Ok(f),
+                },
+                PlanValue::Expr(e) => match plan::eval_expr(e, &ctx.env) {
+                    Ok(v) => v,
+                    Err(msg) => return Ok(Flow::Failed(msg)),
+                },
+            };
+            ctx.env.insert(name.clone(), v);
+            Ok(Flow::Next)
+        }
+        PlanStmt::Call { call, .. } => match exec_call(ctx, call)? {
+            CallOutcome::Output(_) => Ok(Flow::Next),
+            CallOutcome::Halt(f) => Ok(f),
+        },
+        PlanStmt::Approve { summary, body, .. } => exec_approve(ctx, summary, body),
+        PlanStmt::If {
+            cond, then, els, ..
+        } => {
+            let take = match plan::eval_expr(cond, &ctx.env).and_then(|v| plan::as_bool(&v)) {
+                Ok(b) => b,
+                Err(msg) => return Ok(Flow::Failed(msg)),
+            };
+            if take {
+                exec_stmts(ctx, then)
+            } else if let Some(els) = els {
+                exec_stmts(ctx, els)
+            } else {
+                Ok(Flow::Next)
+            }
+        }
+        PlanStmt::For {
+            var, iter, body, ..
+        } => {
+            let items = match plan::eval_expr(iter, &ctx.env) {
+                Ok(Value::Array(a)) => a,
+                Ok(other) => {
+                    return Ok(Flow::Failed(format!(
+                        "`for` expects a list, found a {} value",
+                        json_type_name(&other)
+                    )))
+                }
+                Err(msg) => return Ok(Flow::Failed(msg)),
+            };
+            for item in items {
+                if let Some(f) = ctx.bump_loop() {
+                    return Ok(f);
+                }
+                ctx.env.insert(var.clone(), item);
+                match exec_stmts(ctx, body)? {
+                    Flow::Next => {}
+                    other => return Ok(other),
+                }
+            }
+            Ok(Flow::Next)
+        }
+        PlanStmt::While { cond, body, .. } => loop {
+            let keep = match plan::eval_expr(cond, &ctx.env).and_then(|v| plan::as_bool(&v)) {
+                Ok(b) => b,
+                Err(msg) => return Ok(Flow::Failed(msg)),
+            };
+            if !keep {
+                return Ok(Flow::Next);
+            }
+            if let Some(f) = ctx.bump_loop() {
+                return Ok(f);
+            }
+            match exec_stmts(ctx, body)? {
+                Flow::Next => {}
+                other => return Ok(other),
+            }
+        },
+    }
+}
+
+fn exec_call(ctx: &mut PlanCtx, c: &PlanCall) -> io::Result<CallOutcome> {
+    // 1. Evaluate the input record.
+    let mut input = serde_json::Map::new();
+    for (k, e) in &c.input {
+        match plan::eval_expr(e, &ctx.env) {
+            Ok(v) => {
+                input.insert(k.clone(), v);
+            }
+            Err(msg) => {
+                return Ok(CallOutcome::Halt(Flow::Failed(format!(
+                    "call `{}` input `{}`: {}",
+                    c.tool, k, msg
+                ))))
+            }
+        }
+    }
+    let input = Value::Object(input);
+
+    // 2. Budget bills tool calls reached this walk.
+    ctx.call_index += 1;
+    if ctx.call_index > ctx.spec.step_budget() {
+        return Ok(CallOutcome::Halt(Flow::Budget));
+    }
+    let action_id = format!("c{}", ctx.call_index - 1);
+
+    // 3. Authority FIRST — a plan can only ever call what `allow` grants.
+    if !ctx.spec.allowed_tools().contains(&c.tool) {
+        return Ok(CallOutcome::Halt(Flow::Failed(format!(
+            "tool `{}` is outside the goal's authority",
+            c.tool
+        ))));
+    }
+
+    // 4. Memoize: a receipt for this key means the effect already happened, so
+    //    return the recorded output WITHOUT invoking the tool again — silently
+    //    (no events), which keeps a resume's log free of duplicate tool.called.
+    let key = store::idempotency_key(&ctx.run_id, &action_id, &c.tool, &input);
+    if let Some(existing) = store::find_receipt_by_key(ctx.repo, &ctx.run_id, &key) {
+        return Ok(CallOutcome::Output(existing.output));
+    }
+
+    // 5. Invoke. The (atomic) receipt write is the commit point; the events are
+    //    emitted only AFTER it is durable, so every tool.called in the log has a
+    //    receipt and a crash between commit and event-emit costs only an event.
+    match action::invoke_fake_tool(&c.tool, &input) {
+        Ok(output) => {
+            let rid = store::receipt_id(&key);
+            let receipt = Receipt {
+                receipt_id: rid.clone(),
+                idempotency_key: key.clone(),
+                action_id: action_id.clone(),
+                tool: c.tool.clone(),
+                input: input.clone(),
+                output: output.clone(),
+            };
+            store::save_receipt(ctx.repo, &ctx.run_id, &receipt)?; // <- COMMIT POINT
+            ctx.committed_this_process += 1;
+            ctx.log.append(
+                kind::TOOL_CALLED,
+                json!({ "tool": c.tool, "action": action_id, "idempotency_key": key, "input": input }),
+            )?;
+            ctx.log.append(
+                kind::TOOL_COMPLETED,
+                json!({ "tool": c.tool, "action": action_id, "output": output }),
+            )?;
+            ctx.log.append(
+                kind::RECEIPT_CREATED,
+                json!({ "receipt_id": rid, "tool": c.tool, "action": action_id, "idempotency_key": key }),
+            )?;
+            ctx.state.status = "running".into();
+            ctx.state.pending_approval = None;
+            ctx.save()?;
+            if crash_after_n(ctx.crash, ctx.committed_this_process) {
+                return Ok(CallOutcome::Halt(Flow::Crash));
+            }
+            Ok(CallOutcome::Output(output))
+        }
+        Err(e) => {
+            ctx.log.append(
+                kind::TOOL_FAILED,
+                json!({ "tool": c.tool, "action": action_id, "error": e }),
+            )?;
+            Ok(CallOutcome::Halt(Flow::Failed(format!(
+                "tool `{}` failed: {}",
+                c.tool, e
+            ))))
+        }
+    }
+}
+
+fn exec_approve(ctx: &mut PlanCtx, summary: &str, body: &[PlanStmt]) -> io::Result<Flow> {
+    let action_id = format!("gate{}", ctx.gate_index);
+    ctx.gate_index += 1;
+    let gate_id = store::approval_id(&ctx.run_id, &action_id);
+    let status = store::load_approval(ctx.repo, &ctx.run_id, &gate_id)
+        .ok()
+        .map(|a| a.status);
+    match status.as_deref() {
+        None => {
+            // First reach: propose + request, then PAUSE. The body does NOT run;
+            // re-entry on resume sees the pending file and pauses again.
+            let tool = first_call_tool(body).unwrap_or("plan.gate").to_string();
+            let approval = Approval {
+                id: gate_id.clone(),
+                action_id: action_id.clone(),
+                tool: tool.clone(),
+                summary: summary.to_string(),
+                status: "pending".into(),
+                note: None,
+            };
+            store::save_approval(ctx.repo, &ctx.run_id, &approval)?;
+            ctx.log.append(
+                kind::ACTION_PROPOSED,
+                json!({ "approval_id": gate_id, "gate": action_id, "summary": summary, "tool": tool }),
+            )?;
+            ctx.log.append(
+                kind::APPROVAL_REQUESTED,
+                json!({ "approval_id": gate_id, "gate": action_id, "summary": summary }),
+            )?;
+            ctx.state.status = "awaiting_approval".into();
+            ctx.state.pending_approval = Some(gate_id);
+            ctx.save()?;
+            Ok(Flow::Pause)
+        }
+        Some("pending") => {
+            ctx.state.status = "awaiting_approval".into();
+            ctx.state.pending_approval = Some(gate_id);
+            ctx.save()?;
+            Ok(Flow::Pause)
+        }
+        Some("denied") => {
+            ctx.log.append(
+                kind::ACTION_SKIPPED,
+                json!({ "approval_id": gate_id, "gate": action_id, "reason": "approval denied" }),
+            )?;
+            Ok(Flow::Denied(gate_id))
+        }
+        // "granted" (or any other resolved status) → run the gated body.
+        _ => exec_stmts(ctx, body),
+    }
+}
+
+/// The durable plan loop: one full re-execution of the plan, persisting receipts
+/// and approvals as it goes and finalizing the run from the walk's outcome.
+fn drive_plan(
+    repo: &Path,
+    spec: &GoalSpec,
+    plan_block: &PlanBlock,
+    state: RunState,
+    log: &mut EventLog,
+    crash: Option<ActionCrash>,
+) -> io::Result<RunResult> {
+    let run_id = state.run_id.clone();
+    let baseline = store::list_receipts(repo, &run_id).len() as u64;
+    let mut ctx = PlanCtx {
+        repo,
+        run_id,
+        spec,
+        log,
+        state,
+        env: Env::new(),
+        call_index: 0,
+        gate_index: 0,
+        committed_this_process: 0,
+        baseline_receipts: baseline,
+        loop_iters: 0,
+        crash,
+    };
+
+    let flow = exec_stmts(&mut ctx, &plan_block.stmts)?;
+    let receipts = (ctx.baseline_receipts + ctx.committed_this_process) as usize;
+
+    match flow {
+        Flow::Next => {
+            ctx.state.status = "completed".into();
+            ctx.state.pending_approval = None;
+            ctx.log.append(
+                kind::RUN_COMPLETED,
+                json!({ "kind": "plan", "receipts": receipts, "calls": ctx.call_index }),
+            )?;
+            ctx.save()?;
+            Ok(action_result(ctx.state, false, false))
+        }
+        Flow::Pause => {
+            // exec_approve already saved the awaiting_approval head.
+            Ok(action_result(ctx.state, false, true))
+        }
+        Flow::Denied(id) => {
+            ctx.state.status = "denied".into();
+            ctx.state.pending_approval = None;
+            ctx.log.append(
+                kind::RUN_FAILED,
+                json!({ "reason": "approval denied", "approval_id": id }),
+            )?;
+            ctx.save()?;
+            Ok(action_result(ctx.state, false, false))
+        }
+        Flow::Failed(reason) => {
+            ctx.state.status = "failed".into();
+            ctx.state.pending_approval = None;
+            ctx.log
+                .append(kind::RUN_FAILED, json!({ "reason": reason }))?;
+            ctx.save()?;
+            Ok(action_result(ctx.state, false, false))
+        }
+        Flow::Budget => {
+            ctx.state.status = "budget_exhausted".into();
+            ctx.log.append(
+                kind::BUDGET_EXHAUSTED,
+                json!({ "calls": ctx.call_index, "limit": spec.step_budget() }),
+            )?;
+            ctx.save()?;
+            Ok(action_result(ctx.state, false, false))
+        }
+        Flow::Crash => {
+            // The receipt is durable and the head was saved at the crash point;
+            // leave the status as-is — the run is resumable.
+            Ok(action_result(ctx.state, true, false))
+        }
+    }
+}
+
+fn new_plan_state(run_id: &str, goal: &str) -> RunState {
+    RunState {
+        run_id: run_id.to_string(),
+        goal: goal.to_string(),
+        status: "running".into(),
+        step: 0,
+        consecutive_rejections: 0,
+        patches_applied: 0,
+        patches_rejected: 0,
+        tests_run: 0,
+        regressions: 0,
+        diff_chars: 0,
+        final_errors: 0,
+        tests_passed: 0,
+        tests_failed: 0,
+        kind: "plan".into(),
+        cursor: 0,
+        pending_approval: None,
+        actions_executed: 0,
+        receipts_created: 0,
+    }
+}
+
+/// Start a brand-new plan run from a built-in goal's spec + plan body.
+pub fn start_plan_run(
+    repo: &Path,
+    spec: GoalSpec,
+    plan_block: PlanBlock,
+    crash: Option<ActionCrash>,
+) -> io::Result<RunResult> {
+    let base: BTreeMap<String, String> = BTreeMap::new();
+    let fingerprint = store::fingerprint(&spec.name, &base);
+    let run_id = store::allocate_run(repo, &fingerprint)?;
+    let record = GoalRecord {
+        spec: spec.clone(),
+        strategy: "plan".into(),
+        base_files: base,
+        kind: "plan".into(),
+    };
+    store::save_goal(repo, &run_id, &record)?;
+
+    let mut log = EventLog::create(&events_path(repo, &run_id), &run_id)?;
+    log.append(
+        kind::RUN_STARTED,
+        json!({
+            "goal": spec.name,
+            "kind": "plan",
+            "budget": { "steps": spec.step_budget() },
+            "tools": spec.allow.tools,
+        }),
+    )?;
+
+    let state = new_plan_state(&run_id, &spec.name);
+    store::save_state(repo, &state)?;
+    drive_plan(repo, &spec, &plan_block, state, &mut log, crash)
+}
+
+/// Resume a plan run. There is nothing to "load" beyond the goal name: the plan
+/// is re-derived from the catalog and the walk recomputes everything from the
+/// receipts/ and approvals/ dirs. `state.json` is read only for the cosmetic
+/// `from_step` in the resume event.
+pub fn resume_plan_run(
+    repo: &Path,
+    run_id: &str,
+    crash: Option<ActionCrash>,
+) -> io::Result<RunResult> {
+    let record = store::load_goal(repo, run_id)?;
+    let spec = record.spec;
+    let (_, plan_block) = plan::builtin_plan_goal(&spec.name).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no built-in plan goal `{}` to resume", spec.name),
+        )
+    })?;
+    resume_plan_with(repo, run_id, spec, plan_block, crash)
+}
+
+/// Resume against an already-resolved spec + plan. The catalog path re-derives
+/// these by goal name; this is the seam that does the durable work once they are
+/// in hand (also how tests drive synthetic, non-catalog plans).
+fn resume_plan_with(
+    repo: &Path,
+    run_id: &str,
+    spec: GoalSpec,
+    plan_block: PlanBlock,
+    crash: Option<ActionCrash>,
+) -> io::Result<RunResult> {
+    let state = store::load_state(repo, run_id)?;
+    let mut log = EventLog::resume(&events_path(repo, run_id), run_id)?;
+    log.append(
+        kind::RUN_RESUMED,
+        json!({ "kind": "plan", "from_step": state.step }),
+    )?;
+    drive_plan(repo, &spec, &plan_block, state, &mut log, crash)
+}
+
+// ----- plan replay (pure re-simulation) -----
+//
+// Replay re-walks the plan with no persistence and no crash, reading the recorded
+// approvals as the run's human inputs and re-invoking the deterministic fake
+// tools. It proves reproducibility by comparing the simulated terminal status and
+// receipt set (idempotency key -> output) to the recorded ones — NOT the event
+// sequence, which legitimately differs between a straight and a crashed+resumed
+// run. The walk mirrors the durable one but is read-only; both share the same
+// expression semantics, key formulas, and fake tools, so they cannot diverge in
+// what they decide.
+
+struct ReplayCtx<'a> {
+    repo: &'a Path,
+    run_id: &'a str,
+    spec: &'a GoalSpec,
+    env: Env,
+    call_index: u64,
+    gate_index: u64,
+    loop_iters: u64,
+    receipts: BTreeMap<String, Value>,
+}
+
+fn replay_stmts(ctx: &mut ReplayCtx, stmts: &[PlanStmt]) -> Flow {
+    for s in stmts {
+        match replay_stmt(ctx, s) {
+            Flow::Next => {}
+            other => return other,
+        }
+    }
+    Flow::Next
+}
+
+fn replay_stmt(ctx: &mut ReplayCtx, s: &PlanStmt) -> Flow {
+    match s {
+        PlanStmt::Let { name, value, .. } => {
+            let v = match value {
+                PlanValue::Call(c) => match replay_call(ctx, c) {
+                    Ok(v) => v,
+                    Err(f) => return f,
+                },
+                PlanValue::Expr(e) => match plan::eval_expr(e, &ctx.env) {
+                    Ok(v) => v,
+                    Err(msg) => return Flow::Failed(msg),
+                },
+            };
+            ctx.env.insert(name.clone(), v);
+            Flow::Next
+        }
+        PlanStmt::Call { call, .. } => match replay_call(ctx, call) {
+            Ok(_) => Flow::Next,
+            Err(f) => f,
+        },
+        PlanStmt::Approve { body, .. } => {
+            let action_id = format!("gate{}", ctx.gate_index);
+            ctx.gate_index += 1;
+            let gate_id = store::approval_id(ctx.run_id, &action_id);
+            match store::load_approval(ctx.repo, ctx.run_id, &gate_id)
+                .ok()
+                .map(|a| a.status)
+                .as_deref()
+            {
+                Some("granted") => replay_stmts(ctx, body),
+                Some("denied") => Flow::Denied(gate_id),
+                _ => Flow::Pause,
+            }
+        }
+        PlanStmt::If {
+            cond, then, els, ..
+        } => match plan::eval_expr(cond, &ctx.env).and_then(|v| plan::as_bool(&v)) {
+            Ok(true) => replay_stmts(ctx, then),
+            Ok(false) => els
+                .as_deref()
+                .map(|e| replay_stmts(ctx, e))
+                .unwrap_or(Flow::Next),
+            Err(msg) => Flow::Failed(msg),
+        },
+        PlanStmt::For {
+            var, iter, body, ..
+        } => {
+            let items = match plan::eval_expr(iter, &ctx.env) {
+                Ok(Value::Array(a)) => a,
+                Ok(other) => {
+                    return Flow::Failed(format!(
+                        "`for` expects a list, found a {} value",
+                        json_type_name(&other)
+                    ))
+                }
+                Err(msg) => return Flow::Failed(msg),
+            };
+            for item in items {
+                ctx.loop_iters += 1;
+                if ctx.loop_iters > PLAN_LOOP_LIMIT {
+                    return Flow::Failed("plan exceeded the loop safety limit".into());
+                }
+                ctx.env.insert(var.clone(), item);
+                match replay_stmts(ctx, body) {
+                    Flow::Next => {}
+                    other => return other,
+                }
+            }
+            Flow::Next
+        }
+        PlanStmt::While { cond, body, .. } => loop {
+            match plan::eval_expr(cond, &ctx.env).and_then(|v| plan::as_bool(&v)) {
+                Ok(true) => {}
+                Ok(false) => return Flow::Next,
+                Err(msg) => return Flow::Failed(msg),
+            }
+            ctx.loop_iters += 1;
+            if ctx.loop_iters > PLAN_LOOP_LIMIT {
+                return Flow::Failed("plan exceeded the loop safety limit".into());
+            }
+            match replay_stmts(ctx, body) {
+                Flow::Next => {}
+                other => return other,
+            }
+        },
+    }
+}
+
+fn replay_call(ctx: &mut ReplayCtx, c: &PlanCall) -> Result<Value, Flow> {
+    let mut input = serde_json::Map::new();
+    for (k, e) in &c.input {
+        match plan::eval_expr(e, &ctx.env) {
+            Ok(v) => {
+                input.insert(k.clone(), v);
+            }
+            Err(msg) => return Err(Flow::Failed(msg)),
+        }
+    }
+    let input = Value::Object(input);
+    ctx.call_index += 1;
+    if ctx.call_index > ctx.spec.step_budget() {
+        return Err(Flow::Budget);
+    }
+    let action_id = format!("c{}", ctx.call_index - 1);
+    if !ctx.spec.allowed_tools().contains(&c.tool) {
+        return Err(Flow::Failed(format!(
+            "tool `{}` is outside the goal's authority",
+            c.tool
+        )));
+    }
+    let key = store::idempotency_key(ctx.run_id, &action_id, &c.tool, &input);
+    match action::invoke_fake_tool(&c.tool, &input) {
+        Ok(out) => {
+            ctx.receipts.insert(key, out.clone());
+            Ok(out)
+        }
+        Err(e) => Err(Flow::Failed(format!("tool `{}` failed: {}", c.tool, e))),
+    }
+}
+
+pub fn replay_plan_run(repo: &Path, run_id: &str) -> io::Result<ReplayResult> {
+    let record = store::load_goal(repo, run_id)?;
+    let spec = record.spec;
+    let (_, plan_block) = plan::builtin_plan_goal(&spec.name).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no built-in plan goal `{}` to replay", spec.name),
+        )
+    })?;
+    let recorded = store::load_state(repo, run_id)?;
+    let recorded_receipts: BTreeMap<String, Value> = store::list_receipts(repo, run_id)
+        .into_iter()
+        .map(|r| (r.idempotency_key, r.output))
+        .collect();
+
+    let mut ctx = ReplayCtx {
+        repo,
+        run_id,
+        spec: &spec,
+        env: Env::new(),
+        call_index: 0,
+        gate_index: 0,
+        loop_iters: 0,
+        receipts: BTreeMap::new(),
+    };
+    let status = match replay_stmts(&mut ctx, &plan_block.stmts) {
+        Flow::Next => "completed",
+        Flow::Pause => "awaiting_approval",
+        Flow::Denied(_) => "denied",
+        Flow::Failed(_) => "failed",
+        Flow::Budget => "budget_exhausted",
+        Flow::Crash => "running",
+    }
+    .to_string();
+
+    let identical = status == recorded.status && ctx.receipts == recorded_receipts;
+    Ok(ReplayResult {
+        recorded_status: recorded.status,
+        replayed_status: status,
+        identical,
+        steps: ctx.call_index,
     })
 }
 
@@ -1660,5 +2420,364 @@ mod tests {
             store::approval_id("run_y", "refund")
         );
         assert!(store::approval_id("run_x", "refund").starts_with("apr_"));
+    }
+
+    // ===== Plan-language runtime =====================================
+
+    fn reconcile() -> (GoalSpec, PlanBlock) {
+        crate::plan::builtin_plan_goal("ReconcileChargebacks").expect("catalog entry")
+    }
+    fn retry() -> (GoalSpec, PlanBlock) {
+        crate::plan::builtin_plan_goal("RetryFlakyDeploy").expect("catalog entry")
+    }
+
+    /// Parse a one-off plan goal from source (for authority/budget/nesting edges).
+    fn parse_plan_goal(src: &str, name: &str) -> (GoalSpec, PlanBlock) {
+        let (prog, diags) = Program::parse_sources(vec![SourceFile::new("t.tach", src)]);
+        assert!(
+            diags.iter().all(|d| !d.is_error()),
+            "plan source parse errors: {diags:?}"
+        );
+        let g = crate::goal::find_goal(&prog, name).expect("goal parsed");
+        (GoalSpec::from_decl(g), g.plan.clone().expect("plan block"))
+    }
+
+    fn receipts_by_tool(repo: &Path, run_id: &str, tool: &str) -> usize {
+        store::list_receipts(repo, run_id)
+            .iter()
+            .filter(|r| r.tool == tool)
+            .count()
+    }
+
+    /// Grant the run's single currently-pending gate (mirrors `tach goal approve`)
+    /// and return its gate id.
+    fn approve_pending(repo: &Path, run_id: &str) -> String {
+        let pending = store::list_approvals(repo, run_id)
+            .into_iter()
+            .find(|a| a.status == "pending")
+            .expect("a pending approval");
+        approve(repo, run_id, &pending.action_id);
+        pending.action_id
+    }
+
+    #[test]
+    fn plan_pauses_at_the_first_gate_with_no_effect_yet() {
+        let repo = TempRepo::new("plan_pause");
+        let (spec, plan) = reconcile();
+        let r = start_plan_run(repo.path(), spec, plan, None).unwrap();
+        assert!(r.paused, "pauses at the first duplicate's refund gate");
+        assert_eq!(r.state.status, "awaiting_approval");
+        let id = r.state.run_id.clone();
+        // Only the read (list_disputes) has run; no refund yet.
+        assert_eq!(store::list_receipts(repo.path(), &id).len(), 1);
+        assert_eq!(receipts_by_tool(repo.path(), &id, "fake.stripe.refund"), 0);
+        let pending = store::list_approvals(repo.path(), &id);
+        assert_eq!(pending.iter().filter(|a| a.status == "pending").count(), 1);
+        assert_eq!(count_kind(repo.path(), &id, kind::APPROVAL_REQUESTED), 1);
+    }
+
+    #[test]
+    fn plan_loop_refunds_each_duplicate_exactly_once() {
+        let repo = TempRepo::new("plan_loop");
+        let (spec, plan) = reconcile();
+        let r = start_plan_run(repo.path(), spec, plan, None).unwrap();
+        let id = r.state.run_id.clone();
+        // Two duplicates → two gates, each reached only after the prior resumes.
+        approve_pending(repo.path(), &id);
+        let mid = resume_plan_run(repo.path(), &id, None).unwrap();
+        assert!(mid.paused, "pauses again at the second duplicate's gate");
+        approve_pending(repo.path(), &id);
+        let done = resume_plan_run(repo.path(), &id, None).unwrap();
+        assert_eq!(done.state.status, "completed");
+
+        // 6 receipts: list + (refund,email)×2 + comment×1; exactly two refunds.
+        assert_eq!(store::list_receipts(repo.path(), &id).len(), 6);
+        assert_eq!(receipts_by_tool(repo.path(), &id, "fake.stripe.refund"), 2);
+        assert_eq!(receipts_by_tool(repo.path(), &id, "fake.email.send"), 2);
+        assert_eq!(
+            receipts_by_tool(repo.path(), &id, "fake.zendesk.comment"),
+            1
+        );
+        assert_eq!(refund_tool_calls(repo.path(), &id), 2);
+        assert!(replay_plan_run(repo.path(), &id).unwrap().identical);
+    }
+
+    #[test]
+    fn plan_crash_mid_loop_does_not_double_refund() {
+        // The killer property for loops: crash right after a refund inside the
+        // loop, then resume — the refund must NOT happen a second time.
+        let repo = TempRepo::new("plan_crash_loop");
+        let (spec, plan) = reconcile();
+        let r = start_plan_run(repo.path(), spec, plan, None).unwrap();
+        let id = r.state.run_id.clone();
+        approve_pending(repo.path(), &id);
+        // Crash after the 1st new receipt of this resume — that is the refund.
+        let crashed =
+            resume_plan_run(repo.path(), &id, Some(ActionCrash::AfterReceipt(1))).unwrap();
+        assert!(crashed.crashed);
+        assert_eq!(
+            receipts_by_tool(repo.path(), &id, "fake.stripe.refund"),
+            1,
+            "the first refund is durable after the crash"
+        );
+        // Resume to the next gate, approve it, finish.
+        resume_plan_run(repo.path(), &id, None).unwrap();
+        approve_pending(repo.path(), &id);
+        let done = resume_plan_run(repo.path(), &id, None).unwrap();
+        assert_eq!(done.state.status, "completed");
+
+        // Despite the mid-loop crash: each duplicate refunded exactly once.
+        assert_eq!(refund_tool_calls(repo.path(), &id), 2, "no double refund");
+        assert_eq!(receipts_by_tool(repo.path(), &id, "fake.stripe.refund"), 2);
+        assert!(replay_plan_run(repo.path(), &id).unwrap().identical);
+    }
+
+    #[test]
+    fn plan_while_loop_converges_and_resume_does_not_redeploy() {
+        let repo = TempRepo::new("plan_while");
+        let (spec, plan) = retry();
+        let r = start_plan_run(repo.path(), spec, plan, None).unwrap();
+        let id = r.state.run_id.clone();
+        // The while loop runs deploy on attempts 1,2,3 (succeeds on 3), then
+        // pauses at the announce gate.
+        assert!(r.paused, "pauses at the announce-deploy gate");
+        assert_eq!(
+            receipts_by_tool(repo.path(), &id, "fake.ci.deploy"),
+            3,
+            "three deploy attempts, exactly"
+        );
+        approve_pending(repo.path(), &id);
+        let done = resume_plan_run(repo.path(), &id, None).unwrap();
+        assert_eq!(done.state.status, "completed");
+        // Resuming re-walked the while loop but memoized every deploy: still 3.
+        assert_eq!(receipts_by_tool(repo.path(), &id, "fake.ci.deploy"), 3);
+        assert_eq!(
+            receipts_by_tool(repo.path(), &id, "fake.zendesk.comment"),
+            1
+        );
+        assert!(replay_plan_run(repo.path(), &id).unwrap().identical);
+    }
+
+    #[test]
+    fn plan_while_loop_crash_does_not_repeat_an_attempt() {
+        let repo = TempRepo::new("plan_while_crash");
+        let (spec, plan) = retry();
+        // Crash right after the 2nd deploy commit of the very first walk.
+        let r =
+            start_plan_run(repo.path(), spec, plan, Some(ActionCrash::AfterReceipt(2))).unwrap();
+        assert!(r.crashed);
+        let id = r.state.run_id.clone();
+        assert_eq!(receipts_by_tool(repo.path(), &id, "fake.ci.deploy"), 2);
+        // Resume finishes the loop (3rd attempt) and pauses at the gate.
+        let resumed = resume_plan_run(repo.path(), &id, None).unwrap();
+        assert!(resumed.paused);
+        assert_eq!(
+            receipts_by_tool(repo.path(), &id, "fake.ci.deploy"),
+            3,
+            "exactly one more deploy, never a repeat"
+        );
+        approve_pending(repo.path(), &id);
+        let done = resume_plan_run(repo.path(), &id, None).unwrap();
+        assert_eq!(done.state.status, "completed");
+        assert!(replay_plan_run(repo.path(), &id).unwrap().identical);
+    }
+
+    #[test]
+    fn plan_conditional_else_branch_runs_for_non_duplicates() {
+        let repo = TempRepo::new("plan_cond");
+        let (spec, plan) = reconcile();
+        let r = start_plan_run(repo.path(), spec, plan, None).unwrap();
+        let id = r.state.run_id.clone();
+        approve_pending(repo.path(), &id);
+        resume_plan_run(repo.path(), &id, None).unwrap();
+        approve_pending(repo.path(), &id);
+        resume_plan_run(repo.path(), &id, None).unwrap();
+        // The one non-duplicate charge took the else branch: exactly one comment,
+        // and it was never refunded.
+        assert_eq!(
+            receipts_by_tool(repo.path(), &id, "fake.zendesk.comment"),
+            1
+        );
+        assert_eq!(receipts_by_tool(repo.path(), &id, "fake.stripe.refund"), 2);
+    }
+
+    #[test]
+    fn plan_deny_gate_fails_with_no_side_effect() {
+        let repo = TempRepo::new("plan_deny");
+        let (spec, plan) = reconcile();
+        let r = start_plan_run(repo.path(), spec, plan, None).unwrap();
+        let id = r.state.run_id.clone();
+        // Deny the first refund gate (gate0).
+        deny(repo.path(), &id, "gate0");
+        let done = resume_plan_run(repo.path(), &id, None).unwrap();
+        assert_eq!(done.state.status, "denied");
+        assert!(!done.paused && !done.crashed);
+        assert_eq!(receipts_by_tool(repo.path(), &id, "fake.stripe.refund"), 0);
+        assert_eq!(refund_tool_calls(repo.path(), &id), 0);
+        assert_eq!(count_kind(repo.path(), &id, kind::ACTION_SKIPPED), 1);
+        assert!(replay_plan_run(repo.path(), &id).unwrap().identical);
+    }
+
+    #[test]
+    fn plan_resume_while_pending_is_a_noop() {
+        let repo = TempRepo::new("plan_pending_noop");
+        let (spec, plan) = reconcile();
+        let r = start_plan_run(repo.path(), spec, plan, None).unwrap();
+        let id = r.state.run_id.clone();
+        let approvals_before = store::list_approvals(repo.path(), &id).len();
+        let receipts_before = store::list_receipts(repo.path(), &id).len();
+        let again = resume_plan_run(repo.path(), &id, None).unwrap();
+        assert!(again.paused, "still paused, no progress");
+        assert_eq!(
+            store::list_approvals(repo.path(), &id).len(),
+            approvals_before
+        );
+        assert_eq!(
+            store::list_receipts(repo.path(), &id).len(),
+            receipts_before
+        );
+    }
+
+    #[test]
+    fn plan_ungranted_tool_fails_before_invocation() {
+        let src = r#"goal Sneaky -> Success {
+  budget { steps: 10 }
+  allow {
+    fake.email.send
+  }
+  plan {
+    call fake.stripe.refund { charge_id: "ch_1", amount_cents: 999 }
+  }
+}
+"#;
+        let repo = TempRepo::new("plan_authority");
+        let (spec, plan) = parse_plan_goal(src, "Sneaky");
+        let r = start_plan_run(repo.path(), spec, plan, None).unwrap();
+        assert_eq!(r.state.status, "failed");
+        assert_eq!(store::list_receipts(repo.path(), &r.state.run_id).len(), 0);
+        assert_eq!(
+            count_kind(repo.path(), &r.state.run_id, kind::TOOL_CALLED),
+            0
+        );
+    }
+
+    #[test]
+    fn plan_budget_bounds_a_runaway_loop() {
+        // A loop that would call the tool four times, under a 2-call budget.
+        let src = r#"goal Greedy -> Success {
+  budget { steps: 2 }
+  allow {
+    fake.ci.deploy
+  }
+  plan {
+    let n = 1
+    while n < 9 {
+      let r = call fake.ci.deploy { service: "api", attempt: n }
+      let n = n + 1
+    }
+  }
+}
+"#;
+        let repo = TempRepo::new("plan_budget");
+        let (spec, plan) = parse_plan_goal(src, "Greedy");
+        let r = start_plan_run(repo.path(), spec, plan, None).unwrap();
+        assert_eq!(r.state.status, "budget_exhausted");
+        // Billed against tool calls reached: at most the 2 it was allowed.
+        assert!(store::list_receipts(repo.path(), &r.state.run_id).len() <= 2);
+        assert_eq!(
+            count_kind(repo.path(), &r.state.run_id, kind::BUDGET_EXHAUSTED),
+            1
+        );
+    }
+
+    #[test]
+    fn plan_nested_approvals_pause_in_order() {
+        let src = r#"goal Nested -> Success {
+  budget { steps: 10 }
+  allow {
+    fake.email.send
+  }
+  plan {
+    approve "outer" {
+      approve "inner" {
+        call fake.email.send { to: "x@y.z", template: "t" }
+      }
+    }
+  }
+}
+"#;
+        let repo = TempRepo::new("plan_nested");
+        let (spec, plan) = parse_plan_goal(src, "Nested");
+        let r = start_plan_run(repo.path(), spec.clone(), plan.clone(), None).unwrap();
+        assert!(r.paused, "pauses at the outer gate first");
+        let id = r.state.run_id.clone();
+        // Granting the outer gate reveals the inner gate on the next resume.
+        // (Synthetic goal: resume against the in-hand plan, not the catalog.)
+        approve(repo.path(), &id, "gate0");
+        let inner = resume_plan_with(repo.path(), &id, spec.clone(), plan.clone(), None).unwrap();
+        assert!(inner.paused, "now pauses at the inner gate");
+        assert_eq!(
+            store::list_receipts(repo.path(), &id).len(),
+            0,
+            "no effect yet"
+        );
+        approve(repo.path(), &id, "gate1");
+        let done = resume_plan_with(repo.path(), &id, spec, plan, None).unwrap();
+        assert_eq!(done.state.status, "completed");
+        assert_eq!(receipts_by_tool(repo.path(), &id, "fake.email.send"), 1);
+    }
+
+    #[test]
+    fn plan_replay_of_a_crashed_run_has_an_identical_receipt_set() {
+        // A straight run and a crashed+resumed run of the same goal must replay
+        // to the same status + receipt set, even though their event logs differ.
+        let straight = TempRepo::new("plan_replay_straight");
+        let (s1, p1) = reconcile();
+        let r1 = start_plan_run(straight.path(), s1, p1, None).unwrap();
+        let id1 = r1.state.run_id.clone();
+        approve_pending(straight.path(), &id1);
+        resume_plan_run(straight.path(), &id1, None).unwrap();
+        approve_pending(straight.path(), &id1);
+        resume_plan_run(straight.path(), &id1, None).unwrap();
+
+        let crashed = TempRepo::new("plan_replay_crashed");
+        let (s2, p2) = reconcile();
+        let r2 = start_plan_run(crashed.path(), s2, p2, None).unwrap();
+        let id2 = r2.state.run_id.clone();
+        approve_pending(crashed.path(), &id2);
+        resume_plan_run(crashed.path(), &id2, Some(ActionCrash::AfterReceipt(1))).unwrap();
+        resume_plan_run(crashed.path(), &id2, None).unwrap();
+        approve_pending(crashed.path(), &id2);
+        resume_plan_run(crashed.path(), &id2, None).unwrap();
+
+        let rep1 = replay_plan_run(straight.path(), &id1).unwrap();
+        let rep2 = replay_plan_run(crashed.path(), &id2).unwrap();
+        assert!(rep1.identical && rep2.identical);
+        // The crashed run logged strictly more events (an extra run.resumed) but
+        // produced the same six receipts.
+        assert_eq!(
+            store::list_receipts(straight.path(), &id1).len(),
+            store::list_receipts(crashed.path(), &id2).len()
+        );
+        assert!(
+            read_all(&store::events_path(crashed.path(), &id2))
+                .unwrap()
+                .len()
+                > read_all(&store::events_path(straight.path(), &id1))
+                    .unwrap()
+                    .len()
+        );
+    }
+
+    #[test]
+    fn plan_run_writes_only_under_dot_tach() {
+        let repo = TempRepo::new("plan_iso");
+        let (spec, plan) = reconcile();
+        start_plan_run(repo.path(), spec, plan, None).unwrap();
+        let entries: Vec<String> = std::fs::read_dir(repo.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec![".tach".to_string()], "no stray files at root");
     }
 }

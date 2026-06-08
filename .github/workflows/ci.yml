@@ -43,6 +43,9 @@ jobs:
       - name: End-to-end action layer (approve → crash → resume → one refund → replay)
         run: bash scripts/action_e2e.sh
 
+      - name: End-to-end plan language (loop → per-duplicate approval → mid-loop crash → exactly-once)
+        run: bash scripts/plan_e2e.sh
+
       - name: Tach format check (corpus)
         run: |
           for d in corpus/*/; do

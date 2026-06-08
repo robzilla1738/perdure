@@ -10,17 +10,18 @@ cargo build --release  # single optimized static binary at target/release/tach
 ## Test
 
 ```console
-cargo test                 # 63 unit/integration tests across the front-end, checker,
-                           # runtime, patch pipeline, agent loop, goal + action runtime, formatter
+cargo test                 # 84 unit/integration tests across the front-end, checker, runtime,
+                           # patch pipeline, agent loop, goal + action + plan runtime, formatter
 bash scripts/e2e.sh        # full end-to-end: new → check (expect red) → fix → check/test (green)
 bash scripts/goal_e2e.sh   # goal runtime: run → crash → resume → replay, asserts no repeated work
 bash scripts/action_e2e.sh # action layer: approve → crash → resume → replay, asserts one refund
+bash scripts/plan_e2e.sh   # plan language: loop → per-duplicate approval → mid-loop crash → exactly-once
 tach fmt --check           # the project's .tach files are in one canonical style
 ```
 
 CI runs all of the above on every push — `cargo fmt --check`, `cargo build`, `cargo test`,
-all three end-to-end scripts (`e2e.sh`, `goal_e2e.sh`, `action_e2e.sh`), `tach fmt --check`
-over the corpus, and a JSON-schema validation step. See `.github/workflows/ci.yml`.
+all four end-to-end scripts (`e2e.sh`, `goal_e2e.sh`, `action_e2e.sh`, `plan_e2e.sh`),
+`tach fmt --check` over the corpus, and a JSON-schema validation step. See `.github/workflows/ci.yml`.
 
 ## For automated / cloud agents
 

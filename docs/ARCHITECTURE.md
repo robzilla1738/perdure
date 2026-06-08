@@ -33,8 +33,8 @@ byte-for-byte.
 | `span` | byte-range spans; insertion points are zero-width spans |
 | `source` | offset → line/column, source slicing |
 | `lexer` | tokens with spans; newlines significant except inside `()` / `[]` |
-| `ast` | the tree, with **patch-precise** span fields (`brace_offset`, effects-clause spans, return-type span, field/variant name spans); records, `Result`, sum types, and `match` |
-| `parser` | recursive descent + Pratt expressions; a `no_record_lit` flag disambiguates `if cond {` / `match x {` from `Name {` |
+| `ast` | the tree, with **patch-precise** span fields (`brace_offset`, effects-clause spans, return-type span, field/variant name spans); records, `Result`, sum types, `match`, and the goal `plan` block (`PlanStmt`: `let`/`call`/`approve`/`if`/`for`/`while`) |
+| `parser` | recursive descent + Pratt expressions; a `no_record_lit` flag disambiguates `if cond {` / `match x {` / `for x in expr {` from `Name {`; the plan block reuses the expression grammar with `call`/`approve`/`for`/`while`/`in` as contextual keywords |
 | `diagnostics` | the `Diagnostic` type: human message **and** machine fields (`kind`, `repair_strategies`, `preferred_patch`) |
 | `types` | the type lattice, lenient structural compatibility (`Unknown` ~ anything), and the registry of record fields + enum variants |
 | `builtins` | builtin module members, their effects, and effect metadata |
@@ -45,9 +45,10 @@ byte-for-byte.
 | `agent` | the `fix` loop, the optional `Coder` seam (default off), speculative `race`, the suite benchmark, the agent-era `Metrics`, and the shared repair leaves (`collect_problems`, `pick_candidate`, `build_patch`) the goal runtime reuses |
 | `goal` | the resolved `GoalSpec` (budget, authority, success conditions), decoupled from spans so it serializes into the store |
 | `event` | the `tach.event.v1` envelope and the append-only JSONL `EventLog` |
-| `store` | the durable goal store: `goal.json`, `state.json`, `events.jsonl`, `checkpoints/`, `approvals/`, `receipts/`, the deterministic source `fingerprint`, canonical idempotency/approval ids, and unique run-id allocation |
-| `runtime` | the durable executor — `step_once`/`drive` (the repair loop), and the action layer's `drive_actions` (a fixed plan with approval gates and receipts); `resume_run`/`replay_run` dispatch on `GoalRecord.kind` |
-| `action` | the action layer: the `ActionPlan` model, the offline deterministic **fake tools** (`invoke_fake_tool`), and the built-in goal catalog (`ResolveDuplicateCharge`, `ShipHotfixPR`) |
+| `store` | the durable goal store: `goal.json`, `state.json`, `events.jsonl`, `checkpoints/`, `approvals/`, `receipts/`, the deterministic source `fingerprint`, canonical idempotency/approval ids, **atomic writes** (temp-file + rename), and unique run-id allocation |
+| `runtime` | the durable executor — `step_once`/`drive` (the repair loop), the action layer's `drive_actions` (a fixed plan with approval gates and receipts), and the plan language's `drive_plan` (durable re-execution of a `plan` block); `resume_run`/`replay_run` dispatch on `GoalRecord.kind` |
+| `action` | the linear action layer: the `ActionPlan` model, the offline deterministic **fake tools** (`invoke_fake_tool`), and the built-in goal catalog (`ResolveDuplicateCharge`, `ShipHotfixPR`) |
+| `plan` | the **plan language**: the pure expression evaluator (AST `Expr` → JSON value) and the built-in plan-goal catalog (`ReconcileChargebacks`, `RetryFlakyDeploy`); the durable interpreter lives in `runtime` |
 | `fmt` | the one canonical formatter — a precedence-aware, idempotent AST pretty-printer (goals included) |
 | `schema` | versioned JSON Schemas for every machine output, embedded and served by `tach schema` |
 | `trace` | persist/load `fix`/`race` runs to `.tach/trace.json` (the per-goal history lives in the store) |
@@ -164,9 +165,15 @@ exactly as it was; the durable state lives entirely under `.tach/goals/<run_id>/
   state.json              the mutable RunState head (status, step, metrics)
   events.jsonl            append-only history (one tach.event.v1 per line)
   checkpoints/<step>.json a workspace snapshot taken after each step (repair runs)
-  approvals/<id>.json     a human approval gate on an effectful action (action runs)
-  receipts/<id>.json      durable proof an effectful action ran exactly once (action runs)
+  approvals/<id>.json     a human approval gate on an effect (action + plan runs)
+  receipts/<id>.json      durable proof an effect ran exactly once (action + plan runs)
 ```
+
+For action and plan runs the durable truth is the `approvals/` and `receipts/` dirs (plus the
+event log); `state.json` is a cosmetic head. All durable writes are **atomic** — staged to a
+sibling `.tmp` file and `rename`d into place — so a crash mid-write can never leave a half-written
+receipt that `list_receipts` would silently skip and a resume would mistake for "not yet done"
+(which would re-run the effect). The rename is the commit; a leftover `.tmp` is harmless.
 
 ## The action layer (`action` + `runtime::drive_actions`)
 
@@ -222,6 +229,64 @@ resumed run has a longer log than a straight one, yet produces identical effects
 
 No ambient authority, and the working tree is never touched: an action goal proves its work
 entirely through receipts under `.tach/goals/<run_id>/`.
+
+## The plan language (`plan` + `runtime::drive_plan`)
+
+The linear `ActionPlan` is a straight list of steps. The **plan language** generalizes it to a
+real workflow: a `plan { ... }` block in goal source with `let` bindings, tool `call`s, `approve`
+gates, `if`/`else`, and **`for`/`while` loops**. Expressions reuse the ordinary Tach grammar
+(field access, arithmetic, `&&`/`||`/`!`, comparisons); the interpreter evaluates them in
+JSON-value space, since that is what tools consume and receipts store. Two goals ship built-in:
+`ReconcileChargebacks` (a `for` loop over a tool's output with a per-duplicate refund gate) and
+`RetryFlakyDeploy` (a `while` retry loop that converges).
+
+The execution model is **durable re-execution**. `run` and `resume` are the *same* operation:
+walk the plan from the top. The trick that makes loops and long horizons safe is **memoization
+by receipt** —
+
+```
+exec_call(c):
+  input = eval(c.input)                                  # JSON object
+  call_index += 1                                        # walk-order ordinal
+  if call_index > budget.steps: budget_exhausted
+  if c.tool not in allow.tools: failed                   # authority, before any invoke
+  key = idempotency_key(run_id, "c{call_index}", c.tool, input)
+  if receipt exists for key: return recorded output      # MEMOIZED — no invoke, no events
+  out = invoke_fake_tool(c.tool, input)
+  save receipt(out)                                      # <- atomic commit point
+  emit tool.called, tool.completed, receipt.created       # only after the receipt is durable
+  crash-check; return out
+
+exec_approve(summary, body):
+  gate = approval_id(run_id, "gate{gate_index}"); gate_index += 1
+  read approvals/<gate>:
+    None | pending -> write/keep pending; emit action.proposed, approval.requested; PAUSE
+    denied         -> emit action.skipped; status = denied; stop
+    granted        -> execute body                        # the gated sub-plan runs now
+```
+
+Because `call_index`/`gate_index` are assigned in **walk order** (not at parse time), a loop's
+repeated `call` gets a distinct idempotency key per iteration, and — crucially — the assignment
+is **stable across resume**: every call before the frontier is either a memoized receipt or a
+pure deterministic fake tool, so the branches taken and loop counts are identical on every walk,
+hence the same ordinals and the same keys. That is what lets re-execution stand in for a saved
+program counter. `state.json` is never read back for control flow; it is recomputed from the
+receipts and approvals dirs each time.
+
+Every crash window is safe by the same argument as the action layer, but without a cursor: the
+receipt write is the atomic commit, and a crash before it means the call simply has no receipt,
+so the resume re-invokes the *deterministic* tool and gets the same output. A crash *after* it
+means the resume finds the receipt and returns it without invoking — so a refund inside a loop,
+crashed right after it commits, is replayed for free and never issued twice. `replay_plan_run`
+is a separate pure re-walk (`ReplayCtx`) that reads the recorded approvals as inputs, re-invokes
+the fake tools, and proves the terminal status and receipt set reproduce — sharing the same
+expression semantics, key formulas, and tools as the durable walk so the two cannot disagree.
+
+Budget bills tool calls reached per walk (a `for`/`while` that calls tools is bounded by it); a
+generous `PLAN_LOOP_LIMIT` separately bounds a pathological call-free loop. Approval decisions are
+final once made (the `approve`/`deny` command refuses to change a decided gate), and the plan is
+re-derived from the catalog by goal name on every resume — it is part of the binary's identity,
+the same philosophy as the repair leaves a replay re-runs.
 
 ## Why an interpreter (for now)
 

@@ -50,6 +50,16 @@ pub fn run_state(s: &crate::store::RunState) -> String {
     ));
     let row = |k: &str, v: String| format!("  {:<20} {}\n", k, v);
     out.push_str(&row("status", s.status.clone()));
+    if s.kind == "plan" {
+        // A plan run's progress is its tool calls and receipts, recomputed by
+        // re-execution; there is no linear step cursor to report.
+        out.push_str(&row("tool-calls", s.cursor.to_string()));
+        out.push_str(&row("receipts", s.receipts_created.to_string()));
+        if let Some(a) = &s.pending_approval {
+            out.push_str(&row("awaiting-approval", a.clone()));
+        }
+        return out;
+    }
     out.push_str(&row("steps", s.step.to_string()));
     if s.kind == "action" {
         out.push_str(&row("actions-executed", s.actions_executed.to_string()));

@@ -94,6 +94,35 @@ pub fn invoke_fake_tool(tool: &str, input: &Value) -> Result<Value, String> {
             "ticket_id": get("ticket_id"),
             "status": "posted",
         })),
+        // ----- tools used by the plan-language showcase goals -----
+        // A read that returns a *list*, so a plan can `for charge in
+        // disputes.charges { ... }`. The set is fixed and derived from the
+        // customer digest — three charges, a mix of duplicates and not — so a
+        // loop visibly branches and refunds only the genuine duplicates.
+        "fake.stripe.list_disputes" => {
+            let d = short_digest(input);
+            let tag = &d[..6];
+            Ok(json!({
+                "customer": get("customer"),
+                "charges": [
+                    { "charge_id": format!("ch_{tag}_1"), "amount_cents": 4200, "is_duplicate": true },
+                    { "charge_id": format!("ch_{tag}_2"), "amount_cents": 1599, "is_duplicate": false },
+                    { "charge_id": format!("ch_{tag}_3"), "amount_cents": 8800, "is_duplicate": true },
+                ],
+            }))
+        }
+        // A deploy whose success depends on the attempt number, so a `while`
+        // retry loop genuinely converges (fails on attempts 1–2, succeeds on 3+)
+        // while staying perfectly deterministic — no clock, no randomness.
+        "fake.ci.deploy" => {
+            let attempt = input.get("attempt").and_then(|v| v.as_i64()).unwrap_or(1);
+            Ok(json!({
+                "service": get("service"),
+                "attempt": attempt,
+                "ok": attempt >= 3,
+                "build_id": format!("bld_{}", short_digest(input)),
+            }))
+        }
         other => Err(format!("unknown tool `{other}`")),
     }
 }

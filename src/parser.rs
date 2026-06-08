@@ -265,6 +265,7 @@ impl Parser {
         let mut budget = GoalBudget::default();
         let mut allow = GoalAllow::default();
         let mut require = GoalRequire::default();
+        let mut plan = None;
         while !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
             let before = self.pos;
             if let Tok::Ident(section) = self.peek().clone() {
@@ -274,12 +275,13 @@ impl Parser {
                     "budget" => budget = self.parse_goal_budget(ssp),
                     "allow" => allow = self.parse_goal_allow(ssp),
                     "require" => require = self.parse_goal_require(ssp),
+                    "plan" => plan = Some(self.parse_goal_plan(ssp)),
                     other => {
                         self.push_err(
                             "E0003",
                             "syntax",
                             format!(
-                                "unknown goal section `{}` (expected `budget`, `allow`, or `require`)",
+                                "unknown goal section `{}` (expected `budget`, `allow`, `require`, or `plan`)",
                                 other
                             ),
                             ssp,
@@ -288,7 +290,9 @@ impl Parser {
                     }
                 }
             } else {
-                self.error_here("expected a goal section (`budget`, `allow`, or `require`)");
+                self.error_here(
+                    "expected a goal section (`budget`, `allow`, `require`, or `plan`)",
+                );
             }
             if self.pos == before {
                 self.bump();
@@ -303,6 +307,7 @@ impl Parser {
             budget,
             allow,
             require,
+            plan,
             span: kw.to(close),
         }
     }
@@ -405,6 +410,207 @@ impl Parser {
         }
         self.expect(Tok::RBrace);
         r
+    }
+
+    // ----- plan blocks -----
+
+    /// True when the current token is the identifier `kw` (a contextual keyword
+    /// like `call`/`approve`/`for`/`while`/`in`, none of which the lexer reserves).
+    fn peek_ident_is(&self, kw: &str) -> bool {
+        matches!(self.peek(), Tok::Ident(s) if s.as_str() == kw)
+    }
+
+    /// `plan { <plan-stmts> }` — the durable workflow body of an action goal.
+    fn parse_goal_plan(&mut self, kw: Span) -> PlanBlock {
+        let (stmts, bspan) = self.parse_plan_body();
+        PlanBlock {
+            stmts,
+            span: kw.to(bspan),
+        }
+    }
+
+    /// A brace-delimited run of plan statements; returns the statements and the
+    /// span of the whole `{ ... }`. Shared by the top-level plan and every nested
+    /// body (`if`/`else`/`for`/`while`/`approve`).
+    fn parse_plan_body(&mut self) -> (Vec<PlanStmt>, Span) {
+        let lb = self.expect(Tok::LBrace);
+        let mut stmts = Vec::new();
+        loop {
+            self.skip_newlines();
+            if matches!(self.peek(), Tok::RBrace | Tok::Eof) {
+                break;
+            }
+            let before = self.pos;
+            if let Some(s) = self.parse_plan_stmt() {
+                stmts.push(s);
+            }
+            if self.pos == before {
+                self.bump();
+            }
+        }
+        let rb = self.expect(Tok::RBrace);
+        (stmts, lb.to(rb))
+    }
+
+    fn parse_plan_stmt(&mut self) -> Option<PlanStmt> {
+        let sp = self.peek_span();
+        match self.peek().clone() {
+            Tok::Let => {
+                self.bump();
+                let (name, name_span) = self.expect_ident();
+                self.expect(Tok::Eq);
+                let value = self.parse_plan_value();
+                let end = match &value {
+                    PlanValue::Call(c) => c.span,
+                    PlanValue::Expr(e) => e.span(),
+                };
+                Some(PlanStmt::Let {
+                    name,
+                    name_span,
+                    value,
+                    span: sp.to(end),
+                })
+            }
+            Tok::If => {
+                self.bump();
+                let saved = self.no_record_lit;
+                self.no_record_lit = true;
+                let cond = self.parse_expr();
+                self.no_record_lit = saved;
+                let (then, tspan) = self.parse_plan_body();
+                // Allow `else` on the line after the `}` (newlines are separators,
+                // so without this an `else` on its own line would detach).
+                self.skip_newlines();
+                let (els, end) = if self.eat(&Tok::Else) {
+                    let (eb, espan) = self.parse_plan_body();
+                    (Some(eb), espan)
+                } else {
+                    (None, tspan)
+                };
+                Some(PlanStmt::If {
+                    cond,
+                    then,
+                    els,
+                    span: sp.to(end),
+                })
+            }
+            Tok::Ident(ref kw) if kw == "for" => {
+                self.bump();
+                let (var, var_span) = self.expect_ident();
+                if self.peek_ident_is("in") {
+                    self.bump();
+                } else {
+                    self.error_here("expected `in` after the loop variable");
+                }
+                let saved = self.no_record_lit;
+                self.no_record_lit = true;
+                let iter = self.parse_expr();
+                self.no_record_lit = saved;
+                let (body, bspan) = self.parse_plan_body();
+                Some(PlanStmt::For {
+                    var,
+                    var_span,
+                    iter,
+                    body,
+                    span: sp.to(bspan),
+                })
+            }
+            Tok::Ident(ref kw) if kw == "while" => {
+                self.bump();
+                let saved = self.no_record_lit;
+                self.no_record_lit = true;
+                let cond = self.parse_expr();
+                self.no_record_lit = saved;
+                let (body, bspan) = self.parse_plan_body();
+                Some(PlanStmt::While {
+                    cond,
+                    body,
+                    span: sp.to(bspan),
+                })
+            }
+            Tok::Ident(ref kw) if kw == "approve" => {
+                self.bump();
+                let summary = if let Tok::Str(s) = self.peek().clone() {
+                    self.bump();
+                    s
+                } else {
+                    String::new()
+                };
+                let (body, bspan) = self.parse_plan_body();
+                Some(PlanStmt::Approve {
+                    summary,
+                    body,
+                    span: sp.to(bspan),
+                })
+            }
+            Tok::Ident(ref kw) if kw == "call" => {
+                let call = self.parse_plan_call();
+                let span = sp.to(call.span);
+                Some(PlanStmt::Call { call, span })
+            }
+            _ => {
+                self.error_here(
+                    "expected a plan statement (`let`, `call`, `approve`, `if`, `for`, or `while`)",
+                );
+                self.bump();
+                None
+            }
+        }
+    }
+
+    /// The right-hand side of a plan `let`: a tool call or a pure expression.
+    fn parse_plan_value(&mut self) -> PlanValue {
+        if self.peek_ident_is("call") {
+            PlanValue::Call(self.parse_plan_call())
+        } else {
+            PlanValue::Expr(self.parse_expr())
+        }
+    }
+
+    /// `call <dotted.tool.name> { key: expr, ... }`.
+    fn parse_plan_call(&mut self) -> PlanCall {
+        let start = self.peek_span();
+        self.bump(); // `call`
+        let (tool, tool_span) = self.parse_dotted_name();
+        let (input, end) = self.parse_plan_input();
+        PlanCall {
+            tool,
+            tool_span,
+            input,
+            span: start.to(end),
+        }
+    }
+
+    /// `{ key: expr, ... }` — the tool input record. Fields may be separated by
+    /// commas or newlines (newlines are live inside `{}`), returning the parsed
+    /// pairs and the closing-brace span.
+    fn parse_plan_input(&mut self) -> (Vec<(String, Expr)>, Span) {
+        // Tolerate a newline between the tool name and its input record, so
+        // `call t\n{ ... }` parses (a `call` always has an input record).
+        self.skip_newlines();
+        self.expect(Tok::LBrace);
+        let saved = self.no_record_lit;
+        self.no_record_lit = false;
+        let mut fields = Vec::new();
+        loop {
+            self.skip_newlines();
+            if matches!(self.peek(), Tok::RBrace | Tok::Eof) {
+                break;
+            }
+            let before = self.pos;
+            let (key, _) = self.expect_ident();
+            self.expect(Tok::Colon);
+            let value = self.parse_expr();
+            fields.push((key, value));
+            self.skip_newlines();
+            self.eat(&Tok::Comma);
+            if self.pos == before {
+                self.bump();
+            }
+        }
+        let rb = self.expect(Tok::RBrace);
+        self.no_record_lit = saved;
+        (fields, rb)
     }
 
     /// Parse an unsigned integer literal, recovering to 0 on anything else.
@@ -687,6 +893,8 @@ impl Parser {
                 let cond = self.parse_expr();
                 self.no_record_lit = saved;
                 let then = self.parse_block();
+                // Permit `else` on the line after `}` (newlines are separators).
+                self.skip_newlines();
                 let els = if self.eat(&Tok::Else) {
                     Some(self.parse_block())
                 } else {
@@ -1213,5 +1421,143 @@ fn describe(p: Parity) -> String {
         assert_eq!(g.allow.tools, vec!["tach.check"]);
         assert_eq!(g.require.conditions.len(), 2);
         assert_eq!(g.require.conditions[0].name, "tests.pass");
+        assert!(g.plan.is_none(), "a repair goal has no plan block");
+    }
+
+    #[test]
+    fn parses_a_goal_with_a_plan_block() {
+        let src = r#"goal ReconcileCharges -> Success {
+  budget {
+    steps: 60
+  }
+  allow {
+    fake.stripe.list_disputes
+    fake.stripe.refund
+    fake.email.send
+    fake.zendesk.comment
+  }
+  require {
+    refunds.receipted
+  }
+  plan {
+    let disputes = call fake.stripe.list_disputes { customer: "cus_42" }
+    for charge in disputes.charges {
+      if charge.is_duplicate {
+        approve "refund the duplicate" {
+          let refund = call fake.stripe.refund { charge_id: charge.charge_id, amount_cents: charge.amount_cents, reason: "duplicate" }
+          call fake.email.send { to: "billing@acme.test", template: "refund_issued", charge_id: charge.charge_id }
+        }
+      } else {
+        call fake.zendesk.comment { ticket_id: "zd_dispute", body: "Not a duplicate.", public: false }
+      }
+    }
+  }
+}
+"#;
+        let (module, diags) = parse("plan.tach", src);
+        let errs: Vec<_> = diags.iter().filter(|d| d.is_error()).collect();
+        assert!(errs.is_empty(), "unexpected parse errors: {:?}", errs);
+        let g = module
+            .items
+            .iter()
+            .find_map(|i| match i {
+                Item::Goal(g) => Some(g),
+                _ => None,
+            })
+            .expect("goal parsed");
+        let plan = g.plan.as_ref().expect("plan block parsed");
+        assert_eq!(plan.stmts.len(), 2, "let + for at the top level");
+        // stmt 0: let disputes = call ...
+        match &plan.stmts[0] {
+            PlanStmt::Let {
+                name,
+                value: PlanValue::Call(c),
+                ..
+            } => {
+                assert_eq!(name, "disputes");
+                assert_eq!(c.tool, "fake.stripe.list_disputes");
+                assert_eq!(c.input.len(), 1);
+                assert_eq!(c.input[0].0, "customer");
+            }
+            other => panic!("expected `let .. = call`, got {:?}", other),
+        }
+        // stmt 1: for charge in disputes.charges { if .. else .. }
+        match &plan.stmts[1] {
+            PlanStmt::For {
+                var, iter, body, ..
+            } => {
+                assert_eq!(var, "charge");
+                assert!(matches!(iter, Expr::Field { name, .. } if name == "charges"));
+                assert_eq!(body.len(), 1, "the loop body is a single if/else");
+                match &body[0] {
+                    PlanStmt::If {
+                        cond,
+                        then,
+                        els: Some(els),
+                        ..
+                    } => {
+                        assert!(matches!(cond, Expr::Field { name, .. } if name == "is_duplicate"));
+                        // then-branch is a single approve gate with a 2-call body
+                        match &then[0] {
+                            PlanStmt::Approve { summary, body, .. } => {
+                                assert_eq!(summary, "refund the duplicate");
+                                assert_eq!(body.len(), 2, "refund + email inside the gate");
+                                assert!(matches!(&body[0], PlanStmt::Let { .. }));
+                                assert!(matches!(&body[1], PlanStmt::Call { .. }));
+                            }
+                            other => panic!("expected approve gate, got {:?}", other),
+                        }
+                        // else-branch is a single bare call
+                        assert!(matches!(&els[0], PlanStmt::Call { .. }));
+                    }
+                    other => panic!("expected if/else, got {:?}", other),
+                }
+            }
+            other => panic!("expected a for loop, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn plan_tolerates_newline_before_else_and_call_brace() {
+        // `else` on its own line, and a call whose input record opens on the next
+        // line — both must parse (newlines are otherwise statement separators).
+        let src = r#"goal Forgiving -> Success {
+  allow {
+    fake.email.send
+  }
+  plan {
+    if true {
+      call fake.email.send
+        { to: "a@b.c", template: "x" }
+    }
+    else {
+      call fake.email.send { to: "d@e.f" }
+    }
+  }
+}
+"#;
+        let (module, diags) = parse("forgiving.tach", src);
+        let errs: Vec<_> = diags.iter().filter(|d| d.is_error()).collect();
+        assert!(errs.is_empty(), "unexpected parse errors: {:?}", errs);
+        let g = module
+            .items
+            .iter()
+            .find_map(|i| match i {
+                Item::Goal(g) => Some(g),
+                _ => None,
+            })
+            .expect("goal parsed");
+        let plan = g.plan.as_ref().expect("plan block");
+        match &plan.stmts[0] {
+            PlanStmt::If {
+                then,
+                els: Some(els),
+                ..
+            } => {
+                assert!(matches!(&then[0], PlanStmt::Call { .. }), "multi-line call");
+                assert!(matches!(&els[0], PlanStmt::Call { .. }), "else attached");
+            }
+            other => panic!("expected if/else with attached else, got {:?}", other),
+        }
     }
 }
