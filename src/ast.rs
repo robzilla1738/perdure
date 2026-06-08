@@ -189,6 +189,7 @@ pub enum Expr {
     Field {
         recv: Box<Expr>,
         name: String,
+        name_span: Span,
         span: Span,
     },
     Try {

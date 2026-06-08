@@ -259,7 +259,9 @@ impl<'a> Interp<'a> {
                 let v = self.eval_expr(inner, env)?;
                 Ok(Value::Err(Box::new(v)))
             }
-            Expr::Field { recv, name, span } => {
+            Expr::Field {
+                recv, name, span, ..
+            } => {
                 let r = self.eval_expr(recv, env)?;
                 match r {
                     Value::Record(m) => m.get(name).cloned().ok_or_else(|| {

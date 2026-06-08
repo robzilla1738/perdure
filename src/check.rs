@@ -57,11 +57,25 @@ pub fn check_program(program: &Program) -> Vec<Diagnostic> {
             }
         }
 
-        // --- per-function effect + type checks
+        // --- per-function effect + type checks, plus field-access checks over
+        // every body (functions and tests).
         for item in &unit.module.items {
-            if let Item::Fn(f) = item {
-                check_fn_effects(f, unit, &sigs, &mut diags);
-                check_fn_types(f, unit, &reg, &sigs, &mut diags);
+            match item {
+                Item::Fn(f) => {
+                    check_fn_effects(f, unit, &sigs, &mut diags);
+                    check_fn_types(f, unit, &reg, &sigs, &mut diags);
+                    let mut env: HashMap<String, Type> = f
+                        .params
+                        .iter()
+                        .map(|p| (p.name.clone(), type_from_ast(&p.ty)))
+                        .collect();
+                    check_block_fields(&f.body, &mut env, unit, &reg, &sigs, &mut diags);
+                }
+                Item::Test(t) => {
+                    let mut env: HashMap<String, Type> = HashMap::new();
+                    check_block_fields(&t.body, &mut env, unit, &reg, &sigs, &mut diags);
+                }
+                _ => {}
             }
         }
     }
@@ -377,6 +391,188 @@ fn field_type(rt: &Type, name: &str, reg: &TypeRegistry) -> Type {
     }
 }
 
+// ----- unknown-field checking -----
+
+/// Walk a block validating every field access against the receiver's type, while
+/// threading a scope of locally-bound variable types so `let`-bound receivers
+/// resolve. We only fire when the receiver resolves to a *known* record type;
+/// `Unknown` (and opaque named types) are skipped, keeping the checker lenient.
+fn check_block_fields(
+    b: &Block,
+    env: &mut HashMap<String, Type>,
+    unit: &Unit,
+    reg: &TypeRegistry,
+    sigs: &HashMap<String, FnSig>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    for s in &b.stmts {
+        match s {
+            Stmt::Let { name, value, .. } => {
+                check_expr_fields(value, env, unit, reg, sigs, diags);
+                let t = infer_expr(value, env, sigs, reg);
+                env.insert(name.clone(), t);
+            }
+            Stmt::Return { value: Some(e), .. } => {
+                check_expr_fields(e, env, unit, reg, sigs, diags)
+            }
+            Stmt::Return { value: None, .. } => {}
+            Stmt::Ensure { cond, els, .. } => {
+                check_expr_fields(cond, env, unit, reg, sigs, diags);
+                if let Some(e) = els {
+                    check_expr_fields(e, env, unit, reg, sigs, diags);
+                }
+            }
+            Stmt::If {
+                cond, then, els, ..
+            } => {
+                check_expr_fields(cond, env, unit, reg, sigs, diags);
+                let mut then_env = env.clone();
+                check_block_fields(then, &mut then_env, unit, reg, sigs, diags);
+                if let Some(eb) = els {
+                    let mut else_env = env.clone();
+                    check_block_fields(eb, &mut else_env, unit, reg, sigs, diags);
+                }
+            }
+            Stmt::Expr(e) => check_expr_fields(e, env, unit, reg, sigs, diags),
+        }
+    }
+}
+
+fn check_expr_fields(
+    e: &Expr,
+    env: &HashMap<String, Type>,
+    unit: &Unit,
+    reg: &TypeRegistry,
+    sigs: &HashMap<String, FnSig>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    match e {
+        Expr::Field {
+            recv,
+            name,
+            name_span,
+            ..
+        } => {
+            check_expr_fields(recv, env, unit, reg, sigs, diags);
+            let rt = infer_expr(recv, env, sigs, reg);
+            if let Some(fields) = record_fields_of(&rt, reg) {
+                if !fields.iter().any(|(fname, _)| fname == name) {
+                    diags.push(unknown_field_diag(unit, &rt, name, *name_span, &fields));
+                }
+            }
+        }
+        Expr::Method { recv, args, .. } => {
+            check_expr_fields(recv, env, unit, reg, sigs, diags);
+            for a in args {
+                check_expr_fields(a, env, unit, reg, sigs, diags);
+            }
+        }
+        Expr::Call { callee, args, .. } => {
+            check_expr_fields(callee, env, unit, reg, sigs, diags);
+            for a in args {
+                check_expr_fields(a, env, unit, reg, sigs, diags);
+            }
+        }
+        Expr::Unary { expr, .. } | Expr::Try { expr, .. } => {
+            check_expr_fields(expr, env, unit, reg, sigs, diags)
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            check_expr_fields(lhs, env, unit, reg, sigs, diags);
+            check_expr_fields(rhs, env, unit, reg, sigs, diags);
+        }
+        Expr::Ok(inner, _) | Expr::Err(inner, _) => {
+            check_expr_fields(inner, env, unit, reg, sigs, diags)
+        }
+        Expr::Record { fields, .. } => {
+            for (_, fe) in fields {
+                check_expr_fields(fe, env, unit, reg, sigs, diags);
+            }
+        }
+        Expr::Int(..) | Expr::Float(..) | Expr::Str(..) | Expr::Bool(..) | Expr::Ident(..) => {}
+    }
+}
+
+/// The fields of `t` if it is a known record (named-and-declared, or structural),
+/// else `None`. `Unknown` and opaque named types deliberately return `None`.
+fn record_fields_of(t: &Type, reg: &TypeRegistry) -> Option<Vec<(String, Type)>> {
+    match t {
+        Type::Named(n) => reg.record_fields(n).cloned(),
+        Type::Record(fields) => Some(fields.clone()),
+        _ => None,
+    }
+}
+
+fn unknown_field_diag(
+    unit: &Unit,
+    recv_ty: &Type,
+    field: &str,
+    name_span: Span,
+    fields: &[(String, Type)],
+) -> Diagnostic {
+    let available = fields
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut diag = Diagnostic::error(
+        "E0330",
+        "unknown_field",
+        format!("type `{}` has no field `{}`", recv_ty.display(), field),
+        &unit.source.path,
+        name_span,
+    )
+    .with_note(format!("available fields: {}", available));
+
+    // Only propose a rename when a field is a plausible typo away. Never guess
+    // wildly — an agent would dutifully apply a bad rename.
+    if let Some(best) = nearest_field(field, fields) {
+        diag = diag
+            .with_strategies(&["rename_field"])
+            .with_patch(PreferredPatch {
+                file: unit.source.path.clone(),
+                span: name_span,
+                replacement: best.clone(),
+                rationale: format!("did you mean `{}`?", best),
+            });
+    }
+    diag
+}
+
+/// The closest field name to `field` by edit distance, if one is near enough to
+/// be a plausible typo. Ties resolve to the first field in declared order.
+fn nearest_field(field: &str, fields: &[(String, Type)]) -> Option<String> {
+    let mut best: Option<(usize, &str)> = None;
+    for (name, _) in fields {
+        let d = edit_distance(field, name);
+        if best.map_or(true, |(bd, _)| d < bd) {
+            best = Some((d, name.as_str()));
+        }
+    }
+    match best {
+        Some((d, name)) if d > 0 && (d <= 2 || d * 2 <= field.chars().count()) => {
+            Some(name.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Levenshtein edit distance over Unicode scalar values.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
 // ----- shared body walker -----
 
 fn analyze_block(b: &Block, sigs: &HashMap<String, FnSig>) -> Usage {
@@ -637,5 +833,72 @@ fn session_summary(s: Session) -> String {
         // the type patch should correct String -> Int
         let ty = errors.iter().find(|d| d.kind == "type_mismatch").unwrap();
         assert_eq!(ty.preferred_patch.as_ref().unwrap().replacement, "Int");
+    }
+
+    const FIELD_TYPO: &str = r#"
+type Session = {
+  token: String
+  user_id: Int
+  expires_at: Int
+}
+
+fn summary(s: Session) -> Int {
+  return s.user_idx
+}
+"#;
+
+    #[test]
+    fn unknown_field_suggests_nearest() {
+        let (prog, _) = Program::parse_sources(vec![SourceFile::new("f.tach", FIELD_TYPO)]);
+        let diags = check_program(&prog);
+        let errors: Vec<_> = diags.iter().filter(|d| d.is_error()).collect();
+        let uf = errors
+            .iter()
+            .find(|d| d.kind == "unknown_field")
+            .expect("an unknown_field error");
+        assert_eq!(uf.code, "E0330");
+        // the patch renames the typo to the nearest real field …
+        let patch = uf.preferred_patch.as_ref().expect("a rename patch");
+        assert_eq!(patch.replacement, "user_id");
+        // … and targets exactly the field-name identifier, nothing more.
+        assert_eq!(&FIELD_TYPO[patch.span.start..patch.span.end], "user_idx");
+    }
+
+    const FIELD_FAR: &str = r#"
+type Session = {
+  token: String
+  user_id: Int
+}
+
+fn summary(s: Session) -> Int {
+  return s.zzzzzzz
+}
+"#;
+
+    #[test]
+    fn unknown_field_does_not_guess_wildly() {
+        let (prog, _) = Program::parse_sources(vec![SourceFile::new("f.tach", FIELD_FAR)]);
+        let diags = check_program(&prog);
+        let uf = diags
+            .iter()
+            .find(|d| d.kind == "unknown_field")
+            .expect("an unknown_field error");
+        assert!(
+            uf.preferred_patch.is_none(),
+            "should not propose a far-fetched rename"
+        );
+    }
+
+    #[test]
+    fn known_record_with_unknown_receiver_is_lenient() {
+        // `row` comes from db.query, whose row type is Unknown — accessing fields
+        // on it must NOT produce a false positive (the demo relies on this).
+        let (prog, _) = Program::parse_sources(vec![SourceFile::new("auth.tach", BROKEN)]);
+        let diags = check_program(&prog);
+        assert!(
+            !diags.iter().any(|d| d.kind == "unknown_field"),
+            "no unknown_field on Unknown-typed receivers: {:?}",
+            diags
+        );
     }
 }

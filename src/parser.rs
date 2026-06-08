@@ -580,6 +580,7 @@ impl Parser {
                         e = Expr::Field {
                             recv: Box::new(e),
                             name,
+                            name_span,
                             span,
                         };
                     }
