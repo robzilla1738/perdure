@@ -45,7 +45,7 @@ byte-for-byte.
 | `agent` | the `fix` loop, the optional `Coder` seam (default off), speculative `race`, the suite benchmark, the agent-era `Metrics`, and the shared repair leaves (`collect_problems`, `pick_candidate`, `build_patch`) the goal runtime reuses |
 | `goal` | the resolved `GoalSpec` (budget, authority, success conditions), decoupled from spans so it serializes into the store |
 | `event` | the `tach.event.v1` envelope and the append-only JSONL `EventLog` |
-| `store` | the durable goal store: `goal.json`, `state.json`, `events.jsonl`, `checkpoints/`, and the deterministic, offline run-id derivation |
+| `store` | the durable goal store: `goal.json`, `state.json`, `events.jsonl`, `checkpoints/`, the deterministic source `fingerprint`, and unique run-id allocation |
 | `runtime` | the durable executor — `step_once` (the pure decision), `drive` (persisting loop with budgets, checkpoints, crash), `resume_run`, `replay_run`, `cancel_run` |
 | `fmt` | the one canonical formatter — a precedence-aware, idempotent AST pretty-printer (goals included) |
 | `schema` | versioned JSON Schemas for every machine output, embedded and served by `tach schema` |
@@ -141,10 +141,15 @@ Three properties carry the design:
   loads the latest checkpoint and continues, so the patches already applied are simply
   *not* re-derived — `step_once` sees a workspace where those diagnostics are gone. The
   event log is appended (a `run.resumed` boundary), never rewritten.
-- **Determinism makes it addressable.** The run id is an FNV-1a hash of the goal name and
-  its base source — no clock, no randomness — so `resume`, `replay`, and `inspect` need no
-  external bookkeeping. `replay_run` re-derives the run with the pure `simulate` (the same
-  `step_once`, no I/O) and proves it reproduces the recorded final state.
+- **Determinism makes it addressable; allocation keeps it safe.** `store::fingerprint` is
+  an FNV-1a hash of the goal name and its base source — no clock, no randomness — so the
+  first run of a goal is addressable as a clean `run_<hash>`. But a fingerprint is *not* an
+  identity: `store::allocate_run` turns it into a unique run id by atomically claiming a
+  fresh directory (`fs::create_dir`, which fails if it already exists), handing later runs
+  `run_<hash>-2`, `-3`, …. A fresh run therefore can never collide with — or overwrite — an
+  existing run, and `EventLog::create` uses `create_new` as a last line of defense, refusing
+  to clobber any existing history. `replay_run` re-derives a run with the pure `simulate`
+  (the same `step_once`, no I/O) and proves it reproduces the recorded final state.
 
 The working tree is never half-edited: the runtime operates on an in-memory `Workspace` and
 only writes verified files back when a run reaches `completed`. A crash leaves the source

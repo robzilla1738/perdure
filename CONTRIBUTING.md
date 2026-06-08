@@ -10,14 +10,16 @@ cargo build --release  # single optimized static binary at target/release/tach
 ## Test
 
 ```console
-cargo test             # 32 unit/integration tests across the front-end, checker,
-                       # runtime, patch pipeline, agent loop, and formatter
-bash scripts/e2e.sh    # full end-to-end: new → check (expect red) → fix → check/test (green)
-tach fmt --check       # the project's .tach files are in one canonical style
+cargo test                 # 43 unit/integration tests across the front-end, checker,
+                           # runtime, patch pipeline, agent loop, goal runtime, and formatter
+bash scripts/e2e.sh        # full end-to-end: new → check (expect red) → fix → check/test (green)
+bash scripts/goal_e2e.sh   # goal runtime: run → crash → resume → replay, asserts no repeated work
+tach fmt --check           # the project's .tach files are in one canonical style
 ```
 
 CI runs all of the above on every push — `cargo fmt --check`, `cargo build`, `cargo test`,
-the end-to-end demo, and `tach fmt --check` over the corpus. See `.github/workflows/ci.yml`.
+both end-to-end scripts (`e2e.sh` and `goal_e2e.sh`), `tach fmt --check` over the corpus,
+and a JSON-schema validation step. See `.github/workflows/ci.yml`.
 
 ## For automated / cloud agents
 
@@ -61,6 +63,12 @@ spans are byte offsets so they double as edit coordinates.
   is the core contract of the language. A guessed fix is worse than none: if the repair
   would be a guess, emit the diagnostic without a patch.
 - Determinism is sacred — no wall-clock or randomness in anything that feeds a result, a
-  trace, or the metrics, so `tach replay` stays byte-exact. Ship model/network features
-  behind a flag with the offline path fully covered.
+  trace, or the metrics, so `tach replay` and `tach goal replay` stay byte-exact. Ship
+  model/network features behind a flag with the offline path fully covered.
+- The durable goal store is append-only and never clobbers history. A *fingerprint*
+  (`store::fingerprint`) is a deterministic content hash, not an identity; a fresh run gets
+  a unique id from `store::allocate_run`, and `EventLog::create` uses `create_new` so it is
+  physically incapable of overwriting an existing log. Anything that records run state must
+  preserve those invariants — events are immutable, the working tree is only written on
+  `completed`, and the same authority pipeline (`VerifyOpts`) gates every change.
 - Every new diagnostic ships a test asserting its exact `preferred_patch`.
