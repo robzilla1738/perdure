@@ -52,6 +52,9 @@ jobs:
       - name: End-to-end guard (existing repo: adopt → verify → crash/resume → commit → out-of-scope reject → replay)
         run: bash scripts/guard_e2e.sh
 
+      - name: End-to-end agent interface (generate AGENTS.md → schema-matched context/next/verify → repairable rejection → finalize ≡ commit)
+        run: bash scripts/agent_interface_e2e.sh
+
       - name: Tach format check (corpus)
         run: |
           for d in corpus/*/; do
@@ -62,7 +65,8 @@ jobs:
         run: |
           BIN="$GITHUB_WORKSPACE/target/release/tach"
           for name in diagnostic patch event goal run approval receipt bench test \
-                      guard-context guard-status guard-diff guard-verify guard-commit; do
+                      guard-context guard-status guard-diff guard-verify guard-commit \
+                      guard-next agent-context; do
             "$BIN" schema "$name" | python3 -c 'import sys, json; json.load(sys.stdin)'
           done
           echo "all published schemas are valid JSON"

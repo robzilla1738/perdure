@@ -13,7 +13,8 @@ use crate::program::Program;
 use crate::runner::run_tests;
 use crate::trace::{self, TraceFile};
 use crate::{
-    action, adopt, builtins, event, fmt, guard, plan, project, render, runtime, schema, store, term,
+    action, adopt, builtins, event, fmt, guard, mcp, plan, project, render, runtime, schema, store,
+    term,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -38,6 +39,7 @@ pub fn run(args: Vec<String>) -> i32 {
         "bench" => cmd_bench(&rest),
         "audit" => cmd_audit(&rest),
         "goal" => cmd_goal(&rest),
+        "serve-mcp" => cmd_serve_mcp(&rest),
         "doctor" => cmd_doctor(&rest),
         "explain" => cmd_explain(&rest),
         "schema" => cmd_schema(&rest),
@@ -889,6 +891,27 @@ fn cmd_init(rest: &[String]) -> i32 {
     }
 }
 
+/// `tach serve-mcp` — expose Tach's safe guard/goal operations to an external agent
+/// over the MCP stdio transport. Server-only: no raw shell, no arbitrary file writes.
+fn cmd_serve_mcp(rest: &[String]) -> i32 {
+    let p = parse(rest, &[]);
+    if p.has("--help") || p.has("-h") {
+        println!("{}", term::bold("tach serve-mcp — MCP server (stdio)"));
+        println!();
+        println!("  Exposes guard/goal operations as MCP tools over stdin/stdout.");
+        println!("  Server only: it never runs arbitrary shell or writes files for the agent.");
+        println!("  Point your MCP client at:  tach serve-mcp");
+        return 0;
+    }
+    match mcp::serve(&cwd()) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("{} {}", term::bold_red("error:"), e);
+            1
+        }
+    }
+}
+
 /// `tach goal init <template>` — (re)write the Tachfile for a coding goal.
 fn cmd_goal_init(rest: &[String]) -> i32 {
     let p = parse(rest, &[]);
@@ -951,6 +974,7 @@ fn cmd_guard(rest: &[String]) -> i32 {
         "begin" => cmd_guard_begin(&rest),
         "status" => cmd_guard_status(&rest),
         "context" => cmd_guard_context(&rest),
+        "next" => cmd_guard_next(&rest),
         "diff" => cmd_guard_diff(&rest),
         "verify" => cmd_guard_verify(&rest),
         // `finalize` is the preferred spelling; `commit` is a back-compat alias.
@@ -1038,15 +1062,70 @@ fn cmd_guard_status(rest: &[String]) -> i32 {
 }
 
 fn cmd_guard_context(rest: &[String]) -> i32 {
+    let p = parse(rest, &["--for-agent"]);
+    let root = cwd();
+    let id = match active_or_pos(&p, &root) {
+        Ok(i) => i,
+        Err(c) => return c,
+    };
+    // `--for-agent <name>` renders the full, vendor-neutral agent context. Only the
+    // stable `generic` shape exists today; provider-specific contexts are deferred.
+    if let Some(agent) = p.get("--for-agent") {
+        if agent != "generic" {
+            eprintln!(
+                "{} only `--for-agent generic` is supported (provider-specific contexts are not implemented yet)",
+                term::bold_red("error:")
+            );
+            return 2;
+        }
+        return match guard::agent_context(&root, &id, agent) {
+            Ok(ctx) => {
+                print_json(&ctx);
+                0
+            }
+            Err(e) => {
+                eprintln!("{} {}", term::bold_red("error:"), e);
+                1
+            }
+        };
+    }
+    match guard::context(&root, &id) {
+        Ok(ctx) => {
+            print_json(&ctx);
+            0
+        }
+        Err(e) => {
+            eprintln!("{} {}", term::bold_red("error:"), e);
+            1
+        }
+    }
+}
+
+fn cmd_guard_next(rest: &[String]) -> i32 {
     let p = parse(rest, &[]);
     let root = cwd();
     let id = match active_or_pos(&p, &root) {
         Ok(i) => i,
         Err(c) => return c,
     };
-    match guard::context(&root, &id) {
-        Ok(ctx) => {
-            print_json(&ctx);
+    match guard::next(&root, &id) {
+        Ok(n) => {
+            if p.has("--json") {
+                print_json(&n);
+            } else {
+                println!(
+                    "  {} {} — {}",
+                    term::bold(&n.run_id),
+                    n.status,
+                    term::bold(&n.next_action)
+                );
+                for line in &n.instructions {
+                    println!("    {} {}", term::dim("·"), line);
+                }
+                if !n.recommended_command.is_empty() {
+                    println!("  next:  {}", term::bold(&n.recommended_command));
+                }
+            }
             0
         }
         Err(e) => {
@@ -1138,10 +1217,11 @@ fn cmd_guard_verify(rest: &[String]) -> i32 {
         };
     }
 
-    match guard::verify(&root, &id, rerun) {
-        Ok(s) => {
+    match guard::verify_report(&root, &id, rerun) {
+        Ok(v) => {
+            let s = &v.status;
             if p.has("--json") {
-                print_json(&s);
+                print_json(&v);
             } else if s.verified {
                 println!(
                     "  {} verified — {}/{} command(s) passed, no out-of-scope writes",
@@ -1151,13 +1231,19 @@ fn cmd_guard_verify(rest: &[String]) -> i32 {
                 );
             } else {
                 println!(
-                    "  {} not verified — {}/{} command(s) passed, {} out-of-scope. See {}",
+                    "  {} not verified — {}/{} command(s) passed, {} out-of-scope",
                     term::bold_red("✗"),
                     s.commands_passed,
                     s.commands_required,
-                    s.out_of_scope,
-                    term::bold("tach guard context --json")
+                    s.out_of_scope
                 );
+                // Surface the machine-actionable hint as a human line too.
+                if let Some(rej) = &v.rejection {
+                    println!("    {} {}", term::dim("·"), rej.message);
+                }
+                if !v.recommended_command.is_empty() {
+                    println!("  next:  {}", term::bold(&v.recommended_command));
+                }
             }
             if s.verified {
                 0
@@ -1245,6 +1331,8 @@ fn print_guard_help() {
     println!("  begin <Goal>     open a session over the working tree");
     println!("  status [--json]  phase, verified bit, command counts");
     println!("  context --json   the operating contract for the agent");
+    println!("  context --for-agent generic --json   full agent contract packet");
+    println!("  next [--json]    the single next required action for an agent");
     println!("  diff [--json]    changed files, classified by scope");
     println!("  verify [--rerun] run required commands; set the verified bit");
     println!("  finalize         finalize verified changes into Tach's ledger (never git)");
@@ -2290,7 +2378,7 @@ fn print_help() {
     );
     cmd(
         "guard <sub>",
-        "coding-agent session: begin, status, context, diff, verify, finalize, abort",
+        "coding-agent session: begin, status, context, next, diff, verify, finalize, abort",
     );
     cmd(
         "check [file]",
@@ -2320,6 +2408,10 @@ fn print_help() {
     cmd(
         "goal <sub>",
         "the durable goal runtime: run, list, inspect, resume, replay, cancel",
+    );
+    cmd(
+        "serve-mcp",
+        "expose guard/goal operations to an external agent over MCP (stdio, server-only)",
     );
     cmd(
         "doctor",

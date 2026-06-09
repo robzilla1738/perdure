@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tach.dev/schemas/agent-context.schema.json",
+  "title": "Tach Agent Context (generic)",
+  "description": "The full, vendor-neutral operating context an external coding agent reads before each edit (`tach guard context --for-agent generic --json`). It is the structured front door to one guard session: what you may touch (`allowed_files`), what you must not (`forbidden_files` / `scope_violations`), what Tach will run (`allowed_commands` / `required_commands`), what has changed (`changed_files`), the latest command evidence (`latest_receipts`), the current failure, the `done_condition`, and the single `next_action` with its exact `recommended_command`. Pin the contract with `schema`.",
+  "type": "object",
+  "required": ["schema", "agent", "goal", "run_id", "status", "allowed_files", "forbidden_files", "allowed_commands", "required_commands", "changed_files", "scope_violations", "latest_receipts", "current_failure", "done_condition", "next_action", "recommended_command", "instructions", "verified"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": { "type": "string", "description": "The versioned contract tag, e.g. tach.agent-context.v1." },
+    "agent": { "type": "string", "description": "Which agent shape this is rendered for (currently always generic)." },
+    "goal": { "type": "string", "description": "The goal name resolved from the repo's Tachfile." },
+    "run_id": { "type": "string", "description": "The guard session id." },
+    "status": { "type": "string", "description": "An agent-facing status label: editing | verified | finalized | aborted | blocked." },
+    "allowed_files": { "type": "array", "items": { "type": "string" }, "description": "The fs.write globs the agent may edit." },
+    "forbidden_files": { "type": "array", "items": { "type": "string" }, "description": "Files you have changed that are outside allowed_files — revert these. A flat companion to scope_violations, which carries the reasons." },
+    "allowed_commands": { "type": "array", "items": { "type": "string" }, "description": "The only commands Tach will run, matched verbatim." },
+    "required_commands": { "type": "array", "items": { "type": "string" }, "description": "The commands that must pass for the goal to be verified." },
+    "changed_files": {
+      "type": "object",
+      "description": "The change set since the session baseline, classified against the write scope.",
+      "required": ["added", "modified", "deleted", "in_scope", "out_of_scope"],
+      "additionalProperties": false,
+      "properties": {
+        "added": { "type": "array", "items": { "type": "string" } },
+        "modified": { "type": "array", "items": { "type": "string" } },
+        "deleted": { "type": "array", "items": { "type": "string" } },
+        "in_scope": { "type": "array", "items": { "type": "string" }, "description": "Changed files that match allowed_files." },
+        "out_of_scope": { "type": "array", "items": { "type": "string" }, "description": "Changed files outside allowed_files (these block verify)." }
+      }
+    },
+    "scope_violations": {
+      "type": "array",
+      "description": "The live out-of-scope writes, with the reason and the scope that would have allowed each.",
+      "items": {
+        "type": "object",
+        "required": ["path", "reason", "allowed"],
+        "additionalProperties": false,
+        "properties": {
+          "path": { "type": "string" },
+          "reason": { "type": "string" },
+          "allowed": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "latest_receipts": {
+      "type": "array",
+      "description": "The most recent receipt for each required command: did it pass, and where are its captured stdout/stderr artifacts.",
+      "items": {
+        "type": "object",
+        "required": ["command", "action_id", "exit_code", "timed_out", "duration_ms", "passed", "stdout_artifact", "stderr_artifact"],
+        "additionalProperties": false,
+        "properties": {
+          "command": { "type": "string" },
+          "action_id": { "type": "string" },
+          "exit_code": { "type": ["integer", "null"] },
+          "timed_out": { "type": "boolean" },
+          "duration_ms": { "type": ["integer", "null"] },
+          "passed": { "type": "boolean" },
+          "stdout_artifact": { "type": ["string", "null"], "description": "Repo-relative path to captured stdout." },
+          "stderr_artifact": { "type": ["string", "null"], "description": "Repo-relative path to captured stderr." }
+        }
+      }
+    },
+    "current_failure": { "type": ["string", "null"], "description": "A summary of the most recent failing verify, or null." },
+    "done_condition": { "type": "string", "description": "The exact check the agent must use to decide it is finished." },
+    "next_action": { "type": "string", "description": "edit_then_verify | fix_scope_violation | run_verify | finalize | done | aborted | blocked." },
+    "recommended_command": { "type": "string", "description": "The exact Tach command to run next (empty when the run is terminal)." },
+    "instructions": { "type": "array", "items": { "type": "string" }, "description": "Short, ordered guidance lines for the current state." },
+    "verified": { "type": "boolean", "description": "True only when every required command passed AND no out-of-scope file changed." }
+  }
+}

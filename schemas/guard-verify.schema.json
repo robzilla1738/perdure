@@ -2,9 +2,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://tach.dev/schemas/guard-verify.schema.json",
   "title": "Tach Guard Verify Result",
-  "description": "The result of `tach guard verify [--rerun]` — the same status packet as `tach guard status`, emitted after the scope gate runs and each required command executes (or its receipt is reused). Read `verified`: it is true only when every required command exited 0 AND no out-of-scope file changed. The full command evidence (exit codes, stdout/stderr artifacts) lives in the receipts, not here.",
+  "description": "The result of `tach guard verify [--rerun] --json` — the status packet plus, when the verify was refused, machine-actionable repair hints and the exact next move. Read `verified`: it is true only when every required command exited 0 AND no out-of-scope file changed. On refusal, `rejection` names what to fix and `recommended_command` / `next_action` say what to run next. The full command evidence (exit codes, stdout/stderr artifacts) lives in the receipts, not here.",
   "type": "object",
-  "required": ["run_id", "goal", "phase", "verified", "commands_required", "commands_passed", "out_of_scope", "receipts", "step"],
+  "required": ["run_id", "goal", "phase", "verified", "commands_required", "commands_passed", "out_of_scope", "receipts", "step", "next_action", "recommended_command"],
   "additionalProperties": false,
   "properties": {
     "run_id": { "type": "string", "description": "The guard session id." },
@@ -15,6 +15,42 @@
     "commands_passed": { "type": "integer", "minimum": 0, "description": "How many required commands passed on this verify." },
     "out_of_scope": { "type": "integer", "minimum": 0, "description": "How many changed files fell outside the goal's fs.write scope (a non-zero count fails verify before any command runs)." },
     "receipts": { "type": "integer", "minimum": 0, "description": "How many command receipts this session has minted." },
-    "step": { "type": "integer", "minimum": 0, "description": "The session's cumulative durable-effect step counter." }
+    "step": { "type": "integer", "minimum": 0, "description": "The session's cumulative durable-effect step counter." },
+    "rejection": {
+      "type": ["object", "null"],
+      "description": "Why the verify was refused, with repair strategies to choose between. Null on a clean/verified run.",
+      "required": ["kind", "message", "violations", "repair_strategies", "preferred_next_action"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "type": "string", "description": "scope_violation | command_failed | misconfigured." },
+        "message": { "type": "string", "description": "A human-readable summary of the refusal." },
+        "violations": {
+          "type": "array",
+          "description": "The offending paths for a scope_violation (empty for other kinds).",
+          "items": {
+            "type": "object",
+            "required": ["path", "reason", "allowed"],
+            "additionalProperties": false,
+            "properties": {
+              "path": { "type": "string", "description": "The changed file outside the write scope." },
+              "reason": { "type": "string", "description": "Why it is rejected, e.g. \"not allowed by fs.write\"." },
+              "allowed": { "type": "array", "items": { "type": "string" }, "description": "The fs.write globs that would have allowed it." }
+            }
+          }
+        },
+        "repair_strategies": { "type": "array", "items": { "type": "string" }, "description": "Named strategies, most-preferred first, e.g. revert_out_of_scope_file." },
+        "preferred_next_action": {
+          "type": "object",
+          "required": ["kind", "path"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "type": "string", "description": "revert_file | edit_then_verify | ask_human." },
+            "path": { "type": ["string", "null"], "description": "The file to act on, when the action is file-scoped." }
+          }
+        }
+      }
+    },
+    "next_action": { "type": "string", "description": "The agent's next move: edit_then_verify | fix_scope_violation | run_verify | finalize | done | aborted | blocked." },
+    "recommended_command": { "type": "string", "description": "The exact Tach command to run next (empty when the run is terminal)." }
   }
 }

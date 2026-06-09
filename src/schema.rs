@@ -85,6 +85,16 @@ pub const SCHEMAS: &[Schema] = &[
         title: "guard commit/abort outcome (`tach guard commit --json`)",
         json: include_str!("../schemas/guard-commit.schema.json"),
     },
+    Schema {
+        name: "guard-next",
+        title: "guard next required action (`tach guard next --json`)",
+        json: include_str!("../schemas/guard-next.schema.json"),
+    },
+    Schema {
+        name: "agent-context",
+        title: "generic agent context (`tach guard context --for-agent generic --json`)",
+        json: include_str!("../schemas/agent-context.schema.json"),
+    },
 ];
 
 /// Look up a schema by name.
@@ -128,7 +138,11 @@ mod tests {
     /// breaks integrators.
     #[test]
     fn guard_schemas_match_emitted_shapes() {
-        use crate::guard::{GuardContext, GuardDiff, GuardOutcome, GuardStatus};
+        use crate::guard::{
+            AgentContext, ChangedFiles, GuardContext, GuardDiff, GuardNext, GuardOutcome,
+            GuardStatus, GuardVerify, PreferredNextAction, ReceiptSummary, Rejection,
+            ScopeViolation,
+        };
         use serde_json::json;
         use std::collections::BTreeSet;
 
@@ -198,8 +212,95 @@ mod tests {
             step: 1,
         };
         assert_parity("guard-status", &status);
-        // `verify` emits a status packet — same shape, its own published contract.
-        assert_parity("guard-verify", &status);
+
+        // `verify --json` is the status packet plus repair hints and the next move.
+        assert_parity(
+            "guard-verify",
+            &GuardVerify {
+                status: GuardStatus {
+                    run_id: "run_x".into(),
+                    goal: "FixFailingTests".into(),
+                    phase: "open".into(),
+                    verified: false,
+                    commands_required: 1,
+                    commands_passed: 0,
+                    out_of_scope: 1,
+                    receipts: 0,
+                    step: 1,
+                },
+                rejection: Some(Rejection {
+                    kind: "scope_violation".into(),
+                    message: "1 changed file outside the allowed write scope.".into(),
+                    violations: vec![ScopeViolation {
+                        path: ".github/workflows/ci.yml".into(),
+                        reason: "not allowed by fs.write".into(),
+                        allowed: vec!["src/**".into()],
+                    }],
+                    repair_strategies: vec!["revert_out_of_scope_file".into()],
+                    preferred_next_action: PreferredNextAction {
+                        kind: "revert_file".into(),
+                        path: Some(".github/workflows/ci.yml".into()),
+                    },
+                }),
+                next_action: "fix_scope_violation".into(),
+                recommended_command: "tach guard diff --json".into(),
+            },
+        );
+
+        assert_parity(
+            "guard-next",
+            &GuardNext {
+                run_id: "run_x".into(),
+                goal: "FixFailingTests".into(),
+                status: "editing".into(),
+                next_action: "run_verify".into(),
+                allowed_files: vec!["src/**".into()],
+                allowed_commands: vec!["cargo test".into()],
+                scope_violations: vec![],
+                done_condition: "`tach guard status --json` reports verified=true".into(),
+                recommended_command: "tach guard verify".into(),
+                instructions: vec!["Run `tach guard verify`.".into()],
+            },
+        );
+
+        assert_parity(
+            "agent-context",
+            &AgentContext {
+                schema: "tach.agent-context.v1".into(),
+                agent: "generic".into(),
+                goal: "FixFailingTests".into(),
+                run_id: "run_x".into(),
+                status: "editing".into(),
+                allowed_files: vec!["src/**".into()],
+                forbidden_files: vec![],
+                allowed_commands: vec!["cargo test".into()],
+                required_commands: vec!["cargo test".into()],
+                changed_files: ChangedFiles {
+                    added: vec![],
+                    modified: vec!["src/lib.rs".into()],
+                    deleted: vec![],
+                    in_scope: vec!["src/lib.rs".into()],
+                    out_of_scope: vec![],
+                },
+                scope_violations: vec![],
+                latest_receipts: vec![ReceiptSummary {
+                    command: "cargo test".into(),
+                    action_id: "verify:cargo test".into(),
+                    exit_code: Some(0),
+                    timed_out: false,
+                    duration_ms: Some(12),
+                    passed: true,
+                    stdout_artifact: Some("artifacts/k.stdout".into()),
+                    stderr_artifact: Some("artifacts/k.stderr".into()),
+                }],
+                current_failure: None,
+                done_condition: "`tach guard status --json` reports verified=true".into(),
+                next_action: "run_verify".into(),
+                recommended_command: "tach guard verify".into(),
+                instructions: vec!["Run `tach guard verify`.".into()],
+                verified: false,
+            },
+        );
 
         assert_parity(
             "guard-diff",

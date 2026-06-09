@@ -24,6 +24,7 @@ pub mod goal;
 pub mod guard;
 pub mod interp;
 pub mod lexer;
+pub mod mcp;
 pub mod parser;
 pub mod patch;
 pub mod plan;

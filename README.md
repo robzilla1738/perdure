@@ -279,10 +279,11 @@ ledger.*
 
 ```bash
 cd some-existing-repo
-tach init --existing            # writes Tachfile, TACH_AGENT.md, .tachignore (detects `cargo test`)
+tach init --existing            # writes Tachfile, TACH_AGENT.md, AGENTS.md, .tachignore (detects `cargo test`)
 tach guard begin FixFailingTests
-#   … the agent reads `tach guard context --json` and edits files …
+#   … the agent reads `tach guard context --for-agent generic --json` and edits files …
 tach guard verify               # runs the real test command; captures a receipt; sets verified
+tach guard next                 # the single next required action (edit / fix scope / finalize / done)
 tach guard finalize             # finalizes only if verified — and only in Tach's ledger, never git
 ```
 
@@ -325,6 +326,29 @@ What Tach guarantees across a session:
 Nondeterministic evidence (stdout bytes, durations, exit timing) lives in receipts and
 artifacts; the control-flow event log stays deterministic — the same separation the action
 layer already relies on.
+
+### The agent's structured front door
+
+An external agent never has to infer state from prose. Every answer it needs is a stable,
+versioned JSON packet:
+
+- `tach guard context --for-agent generic --json` — the full operating contract: allowed
+  files and commands, the classified change set, the latest command receipts (with their
+  captured stdout/stderr artifacts), the current failure, the `done_condition`, and the next
+  action. Pin the shape with its `schema` field (`tach.agent-context.v1`).
+- `tach guard next --json` — just the one next required action, with the exact command to run:
+  `edit_then_verify` → `fix_scope_violation` → `run_verify` → `finalize` → `done`.
+- A refused `tach guard verify --json` carries machine-actionable repair hints: the offending
+  paths, the scope that would have allowed them, named `repair_strategies`, and a
+  `preferred_next_action` (e.g. `revert_file`) — compiler-diagnostic ergonomics for a guard
+  refusal.
+- `tach serve-mcp` exposes these same safe operations as MCP tools over stdio — **server-only,
+  with no raw shell and no arbitrary file writes** — so an MCP-speaking agent can drive a
+  guarded repo through structured tool calls. Tach embeds no model; the agent stays outside.
+
+`tach init --existing` also writes a vendor-neutral `AGENTS.md` (only when absent — a
+user-authored one is never touched) spelling out this contract, alongside the Tach-specific
+`TACH_AGENT.md`.
 
 ## Why this is different
 
@@ -457,13 +481,15 @@ The result is a single static binary. Put `target/release/tach` on your `PATH`.
 | Command | What it does |
 | --- | --- |
 | `tach new <name>` | Scaffold a project (`--clean` for an empty one, `--goal chargebacks` for a plan-goal demo) |
-| `tach init --existing` | Adopt an existing repo: write `Tachfile`, `TACH_AGENT.md`, `.tachignore` (`--force` to overwrite) |
+| `tach init --existing` | Adopt an existing repo: write `Tachfile`, `TACH_AGENT.md`, `AGENTS.md` (if absent), `.tachignore` (`--force` to overwrite) |
 | `tach goal init <template>` | Write a `Tachfile` coding goal (e.g. `coding.fix-tests`) |
 | `tach guard begin <Goal>` | Open a coding-agent session over the working tree |
-| `tach guard status` / `context` | Status line, or the agent's operating contract (`--json`) |
+| `tach guard status` / `context` | Status line, or the agent's operating contract (`--json`); `context --for-agent generic --json` for the full agent packet |
+| `tach guard next` | The single next required action for an agent, with the exact command to run (`--json`) |
 | `tach guard diff` | Changed files since the baseline, classified by `fs.write` scope (`--json`) |
-| `tach guard verify` | Run the goal's required commands for real; set the `verified` bit (`--rerun`) |
+| `tach guard verify` | Run the goal's required commands for real; set the `verified` bit; `--json` adds repair hints on refusal (`--rerun`) |
 | `tach guard finalize` / `abort` | Finalize verified changes into Tach's ledger (ledger-only, never git; `commit` is an alias), or cancel the session |
+| `tach serve-mcp` | Serve the safe guard/goal operations to an external agent over MCP (stdio, server-only) |
 | `tach check [file]` | Type- and effect-check; `--json` for the machine view |
 | `tach run [file]` | Run the project's `main` |
 | `tach test [filter]` | Run tests (blocked while the project has errors) |
@@ -488,7 +514,7 @@ The result is a single static binary. Put `target/release/tach` on your `PATH`.
 | `tach goal receipt <id> <rcpt>` | Show one receipt in full (`--json`) |
 | `tach doctor` | Hermetic health check of the toolchain + workspace |
 | `tach explain <code>` | Long-form explanation of a diagnostic code |
-| `tach schema [name]` | Print a versioned JSON schema for any machine output — `diagnostic`, `patch`, `event`, `goal`, `run`, `approval`, `receipt`, `bench`, `test`, and the guard packets `guard-context`, `guard-status`, `guard-diff`, `guard-verify`, `guard-commit` |
+| `tach schema [name]` | Print a versioned JSON schema for any machine output — `diagnostic`, `patch`, `event`, `goal`, `run`, `approval`, `receipt`, `bench`, `test`, and the guard/agent packets `guard-context`, `guard-status`, `guard-diff`, `guard-verify`, `guard-commit`, `guard-next`, `agent-context` |
 
 ## A taste of the language
 
@@ -586,13 +612,24 @@ that a resume would read as "not yet done." There's a pluggable coder seam
 (`tach fix --coder fixture`) whose proposals still go through the exact same pipeline; `tach fmt`
 gives one canonical, idempotent style; `tach schema` publishes versioned JSON schemas for every
 machine output (including `approval` and `receipt`); and `tach doctor` / `tach explain` round out
-the toolchain. **98 passing tests** plus end-to-end checks (red→green, crash→resume→replay, the
-approval/refund/receipt demo, the loop/approval/crash plan demo, and a user-authored plan goal
-that resumes off its source snapshot) and a schema-validation step in CI.
+the toolchain. **The coding harness is real:** `tach init --existing` adopts a real repo (writing
+`Tachfile` / `TACH_AGENT.md` / `AGENTS.md` / `.tachignore` and detecting the test command);
+`tach guard begin` / `verify` / `finalize` scopes an external agent's edits against `fs.write`,
+runs the real test command into receipts, and finalizes **ledger-only (never git)**; the snapshot
+gate tracks dot-directories and file metadata (exec bit, symlink targets). On top of it the
+**agent interface** is a stable structured front door — `tach guard next`, `tach guard context
+--for-agent generic`, machine-actionable repair hints on a refused `verify`, and a **server-only
+`tach serve-mcp`** (no raw shell, no arbitrary file writes; Tach embeds no model). **132 passing
+tests** plus end-to-end checks (red→green, crash→resume→replay, the approval/refund/receipt demo,
+the loop/approval/crash plan demo, a user-authored plan goal that resumes off its source snapshot,
+an existing-repo guard session, and the agent-interface + MCP-server surface) and a
+schema-validation step in CI.
 
 **Near-term follow-ups (the roadmap the runtime is built for):** real tool integrations behind
-the fake-tool seam, typed memory lanes with a context-drift detector, an existing-repo `Tachfile`
-mode that wraps Bun/Cargo/Go test commands, MCP client/server, and a portable goal ABI. The event
+the fake-tool seam, typed memory lanes with a context-drift detector, a scenario DSL that turns
+the shell e2es into Tach-native long-horizon regression tests, a research ledger
+(source/evidence/claim/fact/citation), MCP **client/import** (the server already ships), and a
+portable goal ABI. The event
 log, durable store, authority model, and the approval/receipt substrate are exactly what those
 phases hang off. (User-authored plan goals — write a `plan` block in your own workspace and
 `run`/`check`/`resume`/`replay` it off a source snapshot — already work.) Also: multi-file user
