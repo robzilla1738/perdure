@@ -24,6 +24,12 @@ path = "src/lib.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Unix-only: process-group control so a timed-out command and every descendant
+# it spawned are killed together (see src/shell.rs). std alone can kill the
+# direct child but cannot signal a process group.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [profile.release]
 lto = true
 opt-level = 3
