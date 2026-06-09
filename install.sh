@@ -48,10 +48,12 @@ trap 'rm -rf "$tmp"' EXIT
 
 echo "downloading $name.tar.gz ($tag)"
 curl -fsSL -o "$tmp/$name.tar.gz" "$url"
-curl -fsSL -o "$tmp/$name.tar.gz.sha256" "$url.sha256"
+curl -fsSL -o "$tmp/SHA256SUMS" \
+  "https://github.com/$REPO/releases/download/$tag/SHA256SUMS"
 
 cd "$tmp"
-expected="$(awk '{print $1}' "$name.tar.gz.sha256")"
+expected="$(awk -v f="$name.tar.gz" '$2 == f {print $1}' SHA256SUMS)"
+[ -n "$expected" ] || { echo "error: $name.tar.gz not found in SHA256SUMS" >&2; exit 1; }
 if command -v shasum >/dev/null 2>&1; then
   actual="$(shasum -a 256 "$name.tar.gz" | awk '{print $1}')"
 else
