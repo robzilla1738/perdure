@@ -171,6 +171,13 @@ pub fn goals_root(repo: &Path) -> PathBuf {
     repo.join(".tach").join("goals")
 }
 
+/// The sandbox `HOME` handed to every command Tach runs, in place of the real user
+/// home. Lives under `.tach/` (which the snapshot gate hard-excludes), so a tool
+/// writing into `$HOME` neither leaks credentials from nor churns the real repo.
+pub fn sandbox_home(repo: &Path) -> PathBuf {
+    repo.join(".tach").join("sandbox-home")
+}
+
 pub fn run_dir(repo: &Path, run_id: &str) -> PathBuf {
     goals_root(repo).join(run_id)
 }
@@ -243,15 +250,40 @@ fn atomic_replace(tmp: &Path, dst: &Path) -> io::Result<()> {
     fs::rename(tmp, dst)
 }
 
-/// Replace `dst` with `tmp`. Windows `rename` refuses to overwrite an existing
-/// file (unlike POSIX), so remove the old one first. The window between the
-/// remove and the rename is not crash-atomic, but a crash there leaves either the
-/// fully-written new file or no file — never a half-written one — which is all the
-/// resume logic needs (a missing receipt is simply re-derived).
+/// Replace `dst` with `tmp` atomically on Windows. `std::fs::rename` refuses to
+/// overwrite an existing file, and the old remove-then-rename dance left a crash
+/// window where the destination was *missing* — fatal for a receipt, since a
+/// missing receipt reads as "effect never happened" and re-runs the side effect.
+/// `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` is a true atomic replace (a
+/// reader sees the whole old file or the whole new one), and `MOVEFILE_WRITE_THROUGH`
+/// flushes it to disk before returning — restoring the exactly-once guarantee.
 #[cfg(windows)]
 fn atomic_replace(tmp: &Path, dst: &Path) -> io::Result<()> {
-    let _ = fs::remove_file(dst);
-    fs::rename(tmp, dst)
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    fn wide(p: &Path) -> Vec<u16> {
+        p.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+    let from = wide(tmp);
+    let to = wide(dst);
+    // SAFETY: both pointers reference NUL-terminated wide strings that outlive the
+    // call; the flags are valid for MoveFileExW.
+    let ok = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<T> {
@@ -332,8 +364,17 @@ pub fn load_approval(repo: &Path, run_id: &str, approval_id: &str) -> io::Result
 }
 
 /// Every approval recorded for a run, sorted by id (so output is deterministic).
+/// Lossy: an unparseable file is skipped. For display/inspect only — never for an
+/// approval gate, where a skipped file would read as "no such gate".
 pub fn list_approvals(repo: &Path, run_id: &str) -> Vec<Approval> {
     read_dir_json(&approvals_dir(repo, run_id), |a: &Approval| a.id.clone())
+}
+
+/// Like [`list_approvals`] but a corrupt file is a hard error, not a silent skip —
+/// the variant a resume/gate must use so a damaged approval can never read as
+/// "missing" and let an effect through.
+pub fn list_approvals_strict(repo: &Path, run_id: &str) -> io::Result<Vec<Approval>> {
+    read_dir_json_strict(&approvals_dir(repo, run_id), |a: &Approval| a.id.clone())
 }
 
 // ----- Receipts -----
@@ -349,24 +390,37 @@ pub fn load_receipt(repo: &Path, run_id: &str, receipt_id: &str) -> io::Result<R
     read_json(&receipts_dir(repo, run_id).join(format!("{}.json", receipt_id)))
 }
 
-/// Every receipt recorded for a run, sorted by id.
+/// Every receipt recorded for a run, sorted by id. Lossy: an unparseable file is
+/// skipped — for display/inspect only, never for exactly-once reuse.
 pub fn list_receipts(repo: &Path, run_id: &str) -> Vec<Receipt> {
     read_dir_json(&receipts_dir(repo, run_id), |r: &Receipt| {
         r.receipt_id.clone()
     })
 }
 
+/// Like [`list_receipts`] but a corrupt receipt is a hard error. The variant the
+/// runtime must use on resume/replay/verify: a receipt that exists-but-won't-parse
+/// must block the run (a corrupt run), never read as "missing" — which would re-run
+/// a side effect and break the exactly-once guarantee.
+pub fn list_receipts_strict(repo: &Path, run_id: &str) -> io::Result<Vec<Receipt>> {
+    read_dir_json_strict(&receipts_dir(repo, run_id), |r: &Receipt| {
+        r.receipt_id.clone()
+    })
+}
+
 /// Find a receipt by its idempotency key (per-run-dir scan). The presence of a
 /// receipt for a key means the effect already happened — the driver reuses it
-/// instead of calling the tool again.
-pub fn find_receipt_by_key(repo: &Path, run_id: &str, key: &str) -> Option<Receipt> {
-    list_receipts(repo, run_id)
+/// instead of calling the tool again. Strict: a corrupt receipt in the run dir is
+/// an error, so a damaged proof can never be mistaken for an absent one.
+pub fn find_receipt_by_key(repo: &Path, run_id: &str, key: &str) -> io::Result<Option<Receipt>> {
+    Ok(list_receipts_strict(repo, run_id)?
         .into_iter()
-        .find(|r| r.idempotency_key == key)
+        .find(|r| r.idempotency_key == key))
 }
 
 /// Read every `*.json` in a directory into `T`, skipping unparseable files, sorted
-/// by a caller-supplied key. Returns empty if the directory does not exist.
+/// by a caller-supplied key. Returns empty if the directory does not exist. Lossy
+/// by design — see the strict variant for resume-critical reads.
 fn read_dir_json<T, K>(dir: &Path, key: K) -> Vec<T>
 where
     T: for<'de> Deserialize<'de>,
@@ -385,6 +439,36 @@ where
     }
     items.sort_by_key(&key);
     items
+}
+
+/// Strict twin of [`read_dir_json`]: any `*.json` that fails to parse is an error
+/// (`InvalidData`), not a silent skip. A missing directory is still an empty list —
+/// "no receipts yet" is legitimate; "a receipt that won't parse" is corruption.
+fn read_dir_json_strict<T, K>(dir: &Path, key: K) -> io::Result<Vec<T>>
+where
+    T: for<'de> Deserialize<'de>,
+    K: Fn(&T) -> String,
+{
+    let mut items: Vec<T> = Vec::new();
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(ref e) if e.kind() == io::ErrorKind::NotFound => return Ok(items),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            let v = read_json::<T>(&path).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("corrupt durable record `{}`: {e}", path.display()),
+                )
+            })?;
+            items.push(v);
+        }
+    }
+    items.sort_by_key(&key);
+    Ok(items)
 }
 
 // ----- Active guard session pointer -----
@@ -614,4 +698,71 @@ pub fn input_hash(v: &Value) -> String {
 /// deterministic result ids (e.g. `re_<digest>`) with no clock or randomness.
 pub fn short_digest(v: &Value) -> String {
     fnv1a_hex(&[&canonical_bytes(v)])[..12].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn tmp_repo(tag: &str) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let p =
+            std::env::temp_dir().join(format!("tach_store_{}_{}_{}", std::process::id(), tag, n));
+        let _ = fs::remove_dir_all(&p);
+        p
+    }
+
+    fn receipt(id: &str, key: &str) -> Receipt {
+        Receipt {
+            receipt_id: id.to_string(),
+            idempotency_key: key.to_string(),
+            action_id: "a".into(),
+            tool: "shell.run".into(),
+            input: Value::Null,
+            output: Value::Null,
+            run_id: "run_x".into(),
+            step: 1,
+            effect: "shell.run".into(),
+            input_hash: String::new(),
+            approval_id: None,
+            created_event_id: String::new(),
+        }
+    }
+
+    #[test]
+    fn corrupt_receipt_blocks_strict_reads_but_not_lossy() {
+        let repo = tmp_repo("corrupt_receipt");
+        let run_id = "run_x";
+        save_receipt(&repo, run_id, &receipt("r1", "key1")).unwrap();
+        // A receipt file that exists but won't parse — disk/version corruption.
+        fs::write(receipts_dir(&repo, run_id).join("r2.json"), "{ not json").unwrap();
+
+        // Lossy list skips the bad file; strict list and key lookup must error so a
+        // damaged proof can never be mistaken for an absent one (which would re-run
+        // the effect).
+        assert_eq!(list_receipts(&repo, run_id).len(), 1);
+        assert!(list_receipts_strict(&repo, run_id).is_err());
+        assert!(find_receipt_by_key(&repo, run_id, "key1").is_err());
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn find_receipt_by_key_returns_none_when_absent() {
+        let repo = tmp_repo("absent_receipt");
+        let run_id = "run_x";
+        save_receipt(&repo, run_id, &receipt("r1", "key1")).unwrap();
+        assert!(find_receipt_by_key(&repo, run_id, "key1")
+            .unwrap()
+            .is_some());
+        assert!(find_receipt_by_key(&repo, run_id, "nope")
+            .unwrap()
+            .is_none());
+        // An empty run dir is "no receipts yet", not corruption.
+        let empty = tmp_repo("empty_receipts");
+        assert!(list_receipts_strict(&empty, run_id).unwrap().is_empty());
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&empty);
+    }
 }

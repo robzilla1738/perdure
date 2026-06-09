@@ -122,7 +122,7 @@ impl<'a> Interp<'a> {
 
     pub fn call_fn(&self, f: &FnDecl, args: Vec<Value>) -> Result<Value, Signal> {
         let mut env = Env::new();
-        for (p, v) in f.params.iter().zip(args.into_iter()) {
+        for (p, v) in f.params.iter().zip(args) {
             env.define(&p.name, v);
         }
         match self.eval_block(&f.body, &mut env) {

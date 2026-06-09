@@ -14,7 +14,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -27,6 +27,9 @@ jobs:
 
       - name: Format check
         run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Build
         run: cargo build --verbose
@@ -49,7 +52,7 @@ jobs:
       - name: End-to-end user-authored plan goal (scaffold → check → crash → snapshot-beats-live-edit → replay)
         run: bash scripts/user_plan_e2e.sh
 
-      - name: End-to-end guard (existing repo: adopt → verify → crash/resume → commit → out-of-scope reject → replay)
+      - name: "End-to-end guard (existing repo: adopt → verify → crash/resume → commit → out-of-scope reject → replay)"
         run: bash scripts/guard_e2e.sh
 
       - name: Tach format check (corpus)

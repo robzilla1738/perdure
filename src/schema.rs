@@ -181,7 +181,8 @@ mod tests {
                 forbidden: json!({ "out_of_scope_writes": "rejected at the gate" }),
                 current_failure: None,
                 next_required_action: "edit files in scope, then run `tach guard verify`".into(),
-                done_condition: "`tach guard status --json` reports verified=true".into(),
+                verification_condition: "`tach guard status --json` reports verified=true".into(),
+                done_condition: "verified=true and phase=committed".into(),
                 verified: false,
             },
         );

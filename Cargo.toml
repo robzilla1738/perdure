@@ -30,6 +30,13 @@ serde_json = "1"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Windows-only: a true atomic file replace (MoveFileExW with
+# MOVEFILE_REPLACE_EXISTING) for the durable store — std's rename refuses to
+# overwrite, and remove-then-rename leaves a crash window where a receipt is
+# missing, which would re-run a side effect (see src/store.rs).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
+
 [profile.release]
 lto = true
 opt-level = 3

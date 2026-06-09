@@ -70,7 +70,7 @@ impl Workspace {
                 .get(&file)
                 .ok_or_else(|| format!("edit targets unknown file `{}`", file))?
                 .clone();
-            file_edits.sort_by(|a, b| b.span.start.cmp(&a.span.start));
+            file_edits.sort_by_key(|b| std::cmp::Reverse(b.span.start));
             let mut buf = text;
             for e in file_edits {
                 let start = e.span.start;
