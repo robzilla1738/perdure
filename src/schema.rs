@@ -135,6 +135,21 @@ mod tests {
         assert!(get("nope").is_none());
     }
 
+    /// Rename drift guard: every published contract string lives under the
+    /// `perdure.` namespace. A stray pre-rename `tach.` id would silently fork
+    /// the wire contract for integrators.
+    #[test]
+    fn no_schema_carries_a_pre_rename_id() {
+        assert_eq!(crate::event::EVENT_SCHEMA, "perdure.event.v1");
+        for s in SCHEMAS {
+            assert!(
+                !s.json.contains("tach."),
+                "{} still references a tach.* id",
+                s.name
+            );
+        }
+    }
+
     /// The golden test the module doc promises: a representative output of each
     /// guard packet must have exactly the property set its schema declares, and the
     /// schema's `required` must be a subset of what the Rust type actually emits. No
@@ -272,7 +287,7 @@ mod tests {
         assert_parity(
             "agent-context",
             &AgentContext {
-                schema: "tach.agent-context.v1".into(),
+                schema: "perdure.agent-context.v1".into(),
                 agent: "generic".into(),
                 goal: "FixFailingTests".into(),
                 run_id: "run_x".into(),

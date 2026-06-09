@@ -44,7 +44,7 @@ byte-for-byte.
 | `patch` | `Workspace`, `Edit`, `Patch`, the verify pipeline, call-graph impact analysis, glob scoping |
 | `agent` | the `fix` loop, the optional `Coder` seam (default off), speculative `race`, the suite benchmark, the agent-era `Metrics`, and the shared repair leaves (`collect_problems`, `pick_candidate`, `build_patch`) the goal runtime reuses |
 | `goal` | the resolved `GoalSpec` (budget, authority, success conditions), decoupled from spans so it serializes into the store |
-| `event` | the `tach.event.v2` envelope (a SHA-256 **hash chain** — `prev_hash`/`entry_hash`), the append-only JSONL `EventLog` with `fsync`'d, torn-tail-recoverable appends, and `verify_chain` |
+| `event` | the `perdure.event.v1` envelope (a SHA-256 **hash chain** — `prev_hash`/`entry_hash`), the append-only JSONL `EventLog` with `fsync`'d, torn-tail-recoverable appends, and `verify_chain` |
 | `hash` | a dependency-free, NIST-vector-tested **SHA-256** — the cryptographic digest used wherever a hash must resist a crafted collision (scope-gate content hashes, receipt `input_hash`, the event chain); FNV-1a stays for non-security addressing ids |
 | `store` | the durable goal store: `goal.json`, `state.json`, `events.jsonl`, `checkpoints/`, `approvals/`, `receipts/` (each receipt self-describing — run/step/effect/input-hash/approval/recording-event), the deterministic source `fingerprint`, canonical idempotency/approval ids, **atomic + durable writes** (temp-file → `fsync` → rename → dir-`fsync`), a per-run advisory `RunLock`, and unique run-id allocation |
 | `runtime` | the durable executor — `step_once`/`drive` (the repair loop), the action layer's `drive_actions` (a fixed plan with approval gates and receipts), and the plan language's `drive_plan` (durable re-execution of a `plan` block); `resolve_plan` re-parses a user goal's frozen source snapshot on resume (catalog for built-ins); `resume_run`/`replay_run` dispatch on `GoalRecord.kind` |
@@ -168,7 +168,7 @@ exactly as it was; the durable state lives entirely under `.perdure/goals/<run_i
 .perdure/goals/<run_id>/
   goal.json               the resolved GoalSpec + the base source snapshot
   state.json              the mutable RunState head (status, step, metrics)
-  events.jsonl            append-only, hash-chained history (one tach.event.v2 per line)
+  events.jsonl            append-only, hash-chained history (one perdure.event.v1 per line)
   checkpoints/<step>.json a workspace snapshot taken after each step (repair runs)
   approvals/<id>.json     a human approval gate on an effect (action + plan runs)
   receipts/<id>.json      durable proof an effect ran exactly once (action + plan runs)

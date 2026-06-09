@@ -126,7 +126,7 @@ $ perdure goal replay run_69c04fc4d55f672e
 ```
 
 Everything the run did is a line in an append-only, **hash-chained** log
-(`.perdure/goals/<id>/events.jsonl`, schema `tach.event.v2`) — each event commits to the one
+(`.perdure/goals/<id>/events.jsonl`, schema `perdure.event.v1`) — each event commits to the one
 before it, so any later edit is detectable (`perdure guard audit`):
 
 ```console
@@ -352,7 +352,7 @@ versioned JSON packet:
 - `perdure guard context --for-agent generic --json` — the full operating contract: allowed
   files and commands, the classified change set, the latest command receipts (with their
   captured stdout/stderr artifacts), the current failure, the `done_condition`, and the next
-  action. Pin the shape with its `schema` field (`tach.agent-context.v1`).
+  action. Pin the shape with its `schema` field (`perdure.agent-context.v1`).
 - `perdure guard next --json` — just the one next required action, with the exact command to run:
   `edit_then_verify` → `fix_scope_violation` → `run_verify` → `finalize` → `done`.
 - A refused `perdure guard verify --json` carries machine-actionable repair hints: the offending
@@ -612,7 +612,7 @@ scope, effects, and regressions; the deterministic loop drives the demo to green
 diagnostic family. **The goal runtime is real:** `goal` is a first-class language
 construct with `budget`/`allow`/`require` blocks; `perdure goal run` drives the loop under
 those constraints, checkpointing after every step into a durable store with an append-only
-`tach.event.v1` event history; `perdure goal resume` recovers a crashed run from its last
+`perdure.event.v0` event history; `perdure goal resume` recovers a crashed run from its last
 checkpoint **without repeating work**; `perdure goal replay` proves a run reproduces; and the
 `allow` block is enforced as real authority by the verification pipeline. **The action layer
 is real too:** built-in business goals (`perdure goal run ResolveDuplicateCharge`) run a fixed
@@ -628,7 +628,7 @@ crashes still produce each effect exactly once, and `perdure goal replay` reprod
 writes are atomic **and** durable — staged to a `.tmp`, `fsync`'d, `rename`d, and the directory
 `fsync`'d — so a crash mid-write can't strand a half-written receipt that a resume would read as
 "not yet done," and the guarantee holds across a power loss, not just a clean process exit. The
-event log is a SHA-256 hash chain (`tach.event.v2`), so a tampered or forged history is detectable
+event log is a SHA-256 hash chain (`perdure.event.v1`), so a tampered or forged history is detectable
 (`perdure guard audit`); content hashing in the scope gate is cryptographic for the same reason.
 **The coding harness is real:** `perdure init --existing` adopts a real Cargo/npm/Bun/Go/pytest repo
 (writing `Perdurefile` / `PERDURE_AGENT.md` / `AGENTS.md` / `.perdureignore` and detecting the test command);

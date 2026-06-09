@@ -7,7 +7,7 @@
   "required": ["schema", "event_id", "run_id", "seq", "kind", "timestamp_mode", "payload", "prev_hash", "entry_hash"],
   "additionalProperties": false,
   "properties": {
-    "schema": { "const": "tach.event.v2" },
+    "schema": { "const": "perdure.event.v1" },
     "event_id": { "type": "string", "description": "Stable id derived from seq, e.g. evt_000007." },
     "run_id": { "type": "string" },
     "seq": { "type": "integer", "minimum": 1, "description": "Monotonic sequence number within the run." },

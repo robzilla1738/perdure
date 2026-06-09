@@ -15,11 +15,11 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-/// The schema tag stamped on every event. Bumped to **v2** to carry the
-/// tamper-evident chain fields (`prev_hash`, `entry_hash`). A v1 log (which lacks
-/// them) still deserializes via `#[serde(default)]`, and [`verify_chain`] reports its
+/// The schema tag stamped on every event. v1 carries the tamper-evident chain
+/// fields (`prev_hash`, `entry_hash`). A pre-release log without them still
+/// deserializes via `#[serde(default)]`, and [`verify_chain`] reports its
 /// hash-less events as legacy/unverifiable rather than as tampering.
-pub const EVENT_SCHEMA: &str = "tach.event.v2";
+pub const EVENT_SCHEMA: &str = "perdure.event.v1";
 
 /// The chain anchor: the `prev_hash` of a run's first event. A fixed, content-free
 /// constant — no clock, no randomness — so two identical runs chain identically and
@@ -447,7 +447,7 @@ mod tests {
         log.append("b.event", serde_json::json!({ "i": 2 }))
             .unwrap();
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-        f.write_all(b"{\"schema\":\"tach.event.v1\",\"seq\":99")
+        f.write_all(b"{\"schema\":\"perdure.event.v0\",\"seq\":99")
             .unwrap(); // truncated, no '\n'
         drop(f);
 
@@ -512,7 +512,7 @@ mod tests {
         // A v1 event carries no entry_hash; verify_chain skips it (degrades
         // gracefully on a pre-chain or mixed log) rather than crying tamper.
         let legacy = Event {
-            schema: "tach.event.v1".into(),
+            schema: "perdure.event.v0".into(),
             event_id: "evt_000001".into(),
             run_id: "run_x".into(),
             seq: 1,
@@ -534,7 +534,7 @@ mod tests {
         log.append("a.event", serde_json::json!({ "i": 1 }))
             .unwrap();
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-        f.write_all(b"{\"schema\":\"tach.event.v1\"\n{\"more\":true}\n")
+        f.write_all(b"{\"schema\":\"perdure.event.v0\"\n{\"more\":true}\n")
             .unwrap();
         drop(f);
         assert!(

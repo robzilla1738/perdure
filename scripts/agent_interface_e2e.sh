@@ -91,7 +91,7 @@ props = set(sch["properties"].keys())
 emitted = set(ctx.keys())
 assert emitted == props, f"agent-context keys {sorted(emitted)} != schema properties {sorted(props)}"
 assert set(sch["required"]) <= emitted, f"missing required: {set(sch['required']) - emitted}"
-assert ctx["agent"] == "generic" and ctx["schema"] == "tach.agent-context.v1", ctx["schema"]
+assert ctx["agent"] == "generic" and ctx["schema"] == "perdure.agent-context.v1", ctx["schema"]
 assert ctx["required_commands"] == ["sh check.sh"], ctx["required_commands"]
 assert any("src" in g for g in ctx["allowed_files"]), ctx["allowed_files"]
 print("   ok — agent-context output matches its schema exactly, agent=generic")

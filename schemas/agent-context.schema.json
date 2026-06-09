@@ -7,7 +7,7 @@
   "required": ["schema", "agent", "goal", "run_id", "status", "allowed_files", "forbidden_files", "allowed_commands", "required_commands", "changed_files", "scope_violations", "latest_receipts", "current_failure", "done_condition", "next_action", "recommended_command", "instructions", "verified"],
   "additionalProperties": false,
   "properties": {
-    "schema": { "type": "string", "description": "The versioned contract tag, e.g. tach.agent-context.v1." },
+    "schema": { "type": "string", "description": "The versioned contract tag, e.g. perdure.agent-context.v1." },
     "agent": { "type": "string", "description": "Which agent shape this is rendered for (currently always generic)." },
     "goal": { "type": "string", "description": "The goal name resolved from the repo's Perdurefile." },
     "run_id": { "type": "string", "description": "The guard session id." },

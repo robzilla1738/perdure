@@ -615,7 +615,7 @@ const DONE_CONDITION: &str =
 
 /// The schema tag stamped on the generic agent context, so an integrator can pin
 /// the contract shape independently of the binary version.
-const AGENT_CONTEXT_SCHEMA: &str = "tach.agent-context.v1";
+const AGENT_CONTEXT_SCHEMA: &str = "perdure.agent-context.v1";
 
 /// Everything the agent-facing packets need, computed from one live scope diff so
 /// `next`, `context --for-agent`, and `verify --json` all agree on the same view of
@@ -2106,7 +2106,7 @@ mod tests {
 
         let c = agent_context(r.path(), &id, "generic").unwrap();
         assert_eq!(c.agent, "generic");
-        assert_eq!(c.schema, "tach.agent-context.v1");
+        assert_eq!(c.schema, "perdure.agent-context.v1");
         assert!(c.allowed_files.iter().any(|g| g.contains("src")));
         assert!(c
             .allowed_commands
