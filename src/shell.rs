@@ -46,6 +46,10 @@ pub struct ShellRequest<'a> {
     /// A stable key (the receipt's idempotency key) used to name the artifacts, so
     /// the same command in the same run always writes the same paths.
     pub key: &'a str,
+    /// The `HOME` the child is given — a sandbox dir, never the real user home, so
+    /// a command can't read `~/.npmrc`, `~/.netrc`, `~/.cargo/credentials`, etc.
+    /// Created if absent.
+    pub home: &'a Path,
 }
 
 /// The outcome of a run. `exit_code` is `None` when the child was killed (e.g. by
@@ -63,6 +67,11 @@ pub struct ShellResult {
     pub stderr_bytes: u64,
     /// The tokenized argv actually spawned (argv[0] is the program).
     pub argv: Vec<String>,
+    /// The resolved absolute path of the program that was run, if it could be found
+    /// (argv[0] resolved against the child's `PATH`, or used as-is when it already
+    /// contains a separator). Recorded on the receipt so an audit can see *which*
+    /// binary ran, not just its name. `None` when it could not be resolved.
+    pub program_path: Option<String>,
 }
 
 /// The environment variable names passed through to a child; everything else is
@@ -88,14 +97,57 @@ pub fn allowed_env_names() -> &'static [&'static str] {
     }
 }
 
-/// The redacted environment a child is given: the allowlisted names that are set
-/// in the parent, with their values. Used both to build the child env and to
-/// record the passed-through names on the receipt.
-pub fn redacted_env() -> Vec<(String, String)> {
-    allowed_env_names()
+/// The names whose *values* are taken from the parent, never `HOME`/`USERPROFILE`
+/// — those are forced to the sandbox home so a child can't read credentials out of
+/// the real user home (`~/.npmrc`, `~/.netrc`, `~/.cargo/credentials`, …).
+fn parent_passthrough(name: &str) -> bool {
+    !matches!(name, "HOME" | "USERPROFILE")
+}
+
+/// The redacted environment a child is given: the allowlisted parent values, with
+/// `HOME` (and `USERPROFILE` on Windows) overridden to the sandbox `home`. The
+/// passed-through *names* are still reported on the receipt via
+/// [`allowed_env_names`]; no value is ever recorded.
+pub fn child_env(home: &Path) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = allowed_env_names()
         .iter()
+        .filter(|name| parent_passthrough(name))
         .filter_map(|name| std::env::var(name).ok().map(|v| (name.to_string(), v)))
-        .collect()
+        .collect();
+    let home = home.to_string_lossy().into_owned();
+    env.push(("HOME".to_string(), home.clone()));
+    #[cfg(windows)]
+    env.push(("USERPROFILE".to_string(), home));
+    #[cfg(not(windows))]
+    let _ = home;
+    env
+}
+
+/// Best-effort resolution of `program` (argv[0]) to an absolute path: used as-is
+/// when it already contains a path separator, otherwise searched on `path` (the
+/// child's `PATH`). `None` when no readable candidate is found — purely advisory
+/// audit metadata, never a gate.
+fn resolve_program(program: &str, path: Option<&str>) -> Option<String> {
+    let p = Path::new(program);
+    if p.components().count() > 1 || p.is_absolute() {
+        return p
+            .canonicalize()
+            .ok()
+            .map(|c| c.to_string_lossy().into_owned());
+    }
+    for dir in std::env::split_paths(path.unwrap_or("")) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let cand = dir.join(program);
+        if cand.is_file() {
+            return cand
+                .canonicalize()
+                .ok()
+                .map(|c| c.to_string_lossy().into_owned());
+        }
+    }
+    None
 }
 
 /// Split a command string into argv. Whitespace separates tokens; double quotes
@@ -154,14 +206,23 @@ pub fn tokenize(command: &str) -> Result<Vec<String>, String> {
 pub fn run(req: &ShellRequest) -> io::Result<ShellResult> {
     let argv = tokenize(req.command).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     fs::create_dir_all(req.artifact_dir)?;
+    // The sandbox home must exist before the child runs (tools may write into it).
+    fs::create_dir_all(req.home)?;
     let stdout_path = req.artifact_dir.join(format!("{}.stdout", req.key));
     let stderr_path = req.artifact_dir.join(format!("{}.stderr", req.key));
+
+    let env = child_env(req.home);
+    let child_path = env
+        .iter()
+        .find(|(k, _)| k == "PATH")
+        .map(|(_, v)| v.clone());
+    let program_path = resolve_program(&argv[0], child_path.as_deref());
 
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..])
         .current_dir(req.cwd)
         .env_clear()
-        .envs(redacted_env())
+        .envs(env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -220,6 +281,7 @@ pub fn run(req: &ShellRequest) -> io::Result<ShellResult> {
         stdout_bytes,
         stderr_bytes,
         argv,
+        program_path,
     })
 }
 
@@ -333,6 +395,7 @@ mod tests {
             cwd: dir.path(),
             timeout_ms: 10_000,
             artifact_dir: &dir.path().join("artifacts"),
+            home: &dir.path().join("home"),
             key: "k1",
         })
         .unwrap();
@@ -351,6 +414,7 @@ mod tests {
             cwd: dir.path(),
             timeout_ms: 10_000,
             artifact_dir: &dir.path().join("artifacts"),
+            home: &dir.path().join("home"),
             key: "k2",
         })
         .unwrap();
@@ -366,6 +430,7 @@ mod tests {
             cwd: dir.path(),
             timeout_ms: 20_000,
             artifact_dir: &dir.path().join("artifacts"),
+            home: &dir.path().join("home"),
             key: "k3",
         })
         .unwrap();
@@ -381,6 +446,7 @@ mod tests {
             cwd: dir.path(),
             timeout_ms: 300,
             artifact_dir: &dir.path().join("artifacts"),
+            home: &dir.path().join("home"),
             key: "k4",
         })
         .unwrap();
@@ -407,6 +473,7 @@ mod tests {
             cwd: dir.path(),
             timeout_ms: 300,
             artifact_dir: &dir.path().join("artifacts"),
+            home: &dir.path().join("home"),
             key: "k4b",
         })
         .unwrap();
@@ -433,11 +500,45 @@ mod tests {
             cwd: dir.path(),
             timeout_ms: 10_000,
             artifact_dir: &dir.path().join("artifacts"),
+            home: &dir.path().join("home"),
             key: "k5",
         })
         .unwrap();
         std::env::remove_var("TACH_TEST_SECRET");
         let out = fs::read_to_string(&r.stdout_path).unwrap();
         assert_eq!(out, "CLEAN", "secret leaked into child env");
+    }
+
+    #[test]
+    fn home_is_sandboxed_and_program_resolved() {
+        // The child's HOME is the sandbox dir we pass, never the real user home —
+        // so it cannot read credentials out of `~`. And the resolved program path
+        // is recorded for audit.
+        let dir = TempDir::new("home");
+        let sandbox = dir.path().join("home");
+        let r = run(&ShellRequest {
+            command: "sh -c \"printf %s $HOME\"",
+            cwd: dir.path(),
+            timeout_ms: 10_000,
+            artifact_dir: &dir.path().join("artifacts"),
+            key: "k6",
+            home: &sandbox,
+        })
+        .unwrap();
+        let out = fs::read_to_string(&r.stdout_path).unwrap();
+        assert_eq!(
+            out,
+            sandbox.to_string_lossy(),
+            "child HOME must be the sandbox, not the real home"
+        );
+        assert!(
+            sandbox.exists(),
+            "sandbox home is created before the child runs"
+        );
+        let prog = r.program_path.expect("sh resolved on PATH");
+        assert!(
+            Path::new(&prog).is_absolute(),
+            "resolved program path is absolute: {prog}"
+        );
     }
 }

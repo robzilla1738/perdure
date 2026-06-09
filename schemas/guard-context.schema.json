@@ -2,9 +2,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://tach.dev/schemas/guard-context.schema.json",
   "title": "Tach Guard Context",
-  "description": "The operating-contract packet an external coding agent reads each loop (`tach guard context --json`). It is the machine-readable answer to \"what am I allowed to do, what is failing, and what proves I am done\" for one guard session. An agent should re-read it before every edit: the allow-lists are the gate, and `done_condition` is the only signal that authorizes claiming the task complete.",
+  "description": "The operating-contract packet an external coding agent reads each loop (`tach guard context --json`). It is the machine-readable answer to \"what am I allowed to do, what is failing, and what proves I am done\" for one guard session. An agent should re-read it before every edit: the allow-lists are the gate. `verification_condition` proves the work is correct; `done_condition` is the only signal that authorizes claiming the task complete — it also requires the run to be finalized into the ledger.",
   "type": "object",
-  "required": ["goal", "run_id", "phase", "allowed_files", "allowed_commands", "forbidden", "current_failure", "next_required_action", "done_condition", "verified"],
+  "required": ["goal", "run_id", "phase", "allowed_files", "allowed_commands", "forbidden", "current_failure", "next_required_action", "verification_condition", "done_condition", "verified"],
   "additionalProperties": false,
   "properties": {
     "goal": { "type": "string", "description": "The goal name resolved from the repo's Tachfile, e.g. FixFailingTests." },
@@ -15,7 +15,8 @@
     "forbidden": { "type": "object", "description": "A map of named prohibitions to a human-readable consequence, e.g. out_of_scope_writes / unallowlisted_commands." },
     "current_failure": { "type": ["string", "null"], "description": "A summary of the most recent failing verify, or null if the last verify passed or none has run." },
     "next_required_action": { "type": "string", "description": "The single next step Tach expects, e.g. \"edit files within allowed_files, then run `tach guard verify`\"." },
-    "done_condition": { "type": "string", "description": "The exact check the agent must use to decide it is finished; do not claim done until it holds." },
+    "verification_condition": { "type": "string", "description": "The check that proves the work is correct (every required command passed, no out-of-scope write). Necessary but not sufficient to claim done — the run must still be committed." },
+    "done_condition": { "type": "string", "description": "The exact check the agent must use to decide it is finished; do not claim done until it holds. Stronger than verification_condition: it also requires phase=committed (the run finalized into the ledger)." },
     "verified": { "type": "boolean", "description": "True only when every required command passed AND no out-of-scope file changed." }
   }
 }

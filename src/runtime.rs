@@ -755,7 +755,7 @@ fn drive_actions(
         // idempotency scan makes re-entry safe.
         if action.effectful {
             let key = store::idempotency_key(&run_id, &action.id, &action.tool, &action.input);
-            if let Some(existing) = store::find_receipt_by_key(repo, &run_id, &key) {
+            if let Some(existing) = store::find_receipt_by_key(repo, &run_id, &key)? {
                 // Already done in a prior (crashed) pass — never invoke twice.
                 log.append(
                     kind::RECEIPT_REUSED,
@@ -1248,7 +1248,7 @@ fn exec_call(ctx: &mut PlanCtx, c: &PlanCall) -> io::Result<CallOutcome> {
     //    return the recorded output WITHOUT invoking the tool again — silently
     //    (no events), which keeps a resume's log free of duplicate tool.called.
     let key = store::idempotency_key(&ctx.run_id, &action_id, &c.tool, &input);
-    if let Some(existing) = store::find_receipt_by_key(ctx.repo, &ctx.run_id, &key) {
+    if let Some(existing) = store::find_receipt_by_key(ctx.repo, &ctx.run_id, &key)? {
         return Ok(CallOutcome::Output(existing.output));
     }
 

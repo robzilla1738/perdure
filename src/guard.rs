@@ -60,8 +60,13 @@ pub struct GuardContext {
     pub forbidden: Value,
     pub current_failure: Option<String>,
     pub next_required_action: String,
+    /// The check that proves the work itself is correct: every required command
+    /// passed and no out-of-scope write is present. Necessary, but *not* sufficient
+    /// to claim the task done — the run must still be finalized into the ledger.
+    pub verification_condition: String,
     /// The single check an agent must use to decide it is finished, stated so the
-    /// packet is self-describing: do not claim done until this holds.
+    /// packet is self-describing: do not claim done until this holds. Stronger than
+    /// `verification_condition` — it also requires the run to be committed.
     pub done_condition: String,
     pub verified: bool,
 }
@@ -154,6 +159,30 @@ pub fn begin(repo: &Path, goal_name: Option<&str>) -> io::Result<RunState> {
     };
     let spec = GoalSpec::from_decl(decl);
 
+    // A guard session governs an external agent editing a real repo, so its goal
+    // must be fully specified before we open it — no ambient authority, no
+    // evidence-free "success". Reject under-specified coding goals up front.
+    if spec.required_commands().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "coding goal `{}` must declare at least one `require {{ command(\"…\").passes }}` — \
+                 a guard session cannot verify without command evidence",
+                spec.name
+            ),
+        ));
+    }
+    if spec.allow.fs_write.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "coding goal `{}` must declare an `allow {{ fs.write [...] }}` scope — \
+                 a guard session never grants unrestricted write authority",
+                spec.name
+            ),
+        ));
+    }
+
     let fingerprint = store::fingerprint(&spec.name, &BTreeMap::new());
     let run_id = store::allocate_run(repo, &fingerprint)?;
     let record = GoalRecord {
@@ -224,19 +253,43 @@ fn scope_diff(
     let head = snapshot::snapshot(repo, &Ignore::load(repo))?;
     let diff = snapshot::diff(&baseline, &head);
     let writes = spec.allowed_writes();
+    // For a guard session, the goal *must* declare `fs.write` (enforced at
+    // `begin`). Treat an absent scope as "no writes allowed" so a missing grant can
+    // never silently mean unrestricted authority — the opposite of Tach's thesis.
+    let in_writable = |path: &str| match &writes {
+        Some(globs) => globs.iter().any(|g| glob_match(g, path)),
+        None => false,
+    };
+    let is_symlink = |path: &str| {
+        matches!(
+            head.get(path).map(|e| e.kind),
+            Some(snapshot::EntryKind::Symlink)
+        )
+    };
     let mut in_scope = Vec::new();
     let mut out_of_scope = Vec::new();
     for path in diff.changed() {
-        let ok = match &writes {
-            Some(globs) => globs.iter().any(|g| glob_match(g, &path)),
-            None => true, // no fs.write restriction declared → nothing is out of scope
-        };
-        if ok {
+        // A symlink under writable scope is rejected by default: Tach never follows
+        // it, so a write *through* the link lands outside the gate's view.
+        if in_writable(&path) && !is_symlink(&path) {
             in_scope.push(path);
         } else {
             out_of_scope.push(path);
         }
     }
+    // A pre-existing symlink under writable scope is a write-through vector even
+    // when the link itself never appears in the diff (its target path is unchanged,
+    // only the pointed-to bytes moved). Reject any such link in the head tree.
+    for (path, entry) in &head {
+        if entry.kind == snapshot::EntryKind::Symlink
+            && in_writable(path)
+            && !out_of_scope.contains(path)
+        {
+            out_of_scope.push(path.clone());
+        }
+    }
+    out_of_scope.sort();
+    out_of_scope.dedup();
     Ok((head, diff, in_scope, out_of_scope))
 }
 
@@ -261,6 +314,21 @@ fn rel(repo: &Path, p: &Path) -> String {
         .unwrap_or(p)
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+/// The history payload for one out-of-scope write, naming *why* it was rejected so
+/// the agent can react: a `symlink` under writable scope (a write-through vector
+/// Tach refuses by default) versus an ordinary `out_of_scope` path.
+fn scope_violation(head: &Manifest, path: &str, allowed: &[String]) -> Value {
+    let reason = if matches!(
+        head.get(path).map(|e| e.kind),
+        Some(snapshot::EntryKind::Symlink)
+    ) {
+        "symlink"
+    } else {
+        "out_of_scope"
+    };
+    json!({ "path": path, "allowed": allowed, "reason": reason })
 }
 
 /// A receipt is a pass iff its command exited 0 and did not time out.
@@ -307,7 +375,10 @@ pub fn context(repo: &Path, run_id: &str) -> io::Result<GuardContext> {
         }),
         current_failure: last_failure(repo, run_id),
         next_required_action: next.to_string(),
-        done_condition: "`tach guard status --json` reports verified=true".to_string(),
+        verification_condition: "`tach guard status --json` reports verified=true".to_string(),
+        done_condition: "`tach guard status --json` reports verified=true and phase=committed \
+             (run `tach guard commit` after a green verify)"
+            .to_string(),
         verified: state.verified,
     })
 }
@@ -362,7 +433,7 @@ pub fn verify_inner(
         for path in &out_of_scope {
             log.append(
                 kind::SCOPE_VIOLATION,
-                json!({ "path": path, "allowed": spec.allow.fs_write }),
+                scope_violation(&head, path, &spec.allow.fs_write),
             )?;
         }
         let summary = format!(
@@ -399,7 +470,7 @@ pub fn verify_inner(
         let mut key_input = json!({ "command": cmd, "cwd": ".", "tree": digest });
         if rerun {
             // A fresh attempt nonce forces a new receipt even if the tree is unchanged.
-            let attempts = store::list_receipts(repo, run_id)
+            let attempts = store::list_receipts_strict(repo, run_id)?
                 .iter()
                 .filter(|r| r.input.get("command").and_then(|v| v.as_str()) == Some(cmd.as_str()))
                 .count();
@@ -407,7 +478,7 @@ pub fn verify_inner(
         }
         let key = store::idempotency_key(run_id, &action_id, "shell.run", &key_input);
 
-        let receipt = if let Some(existing) = store::find_receipt_by_key(repo, run_id, &key) {
+        let receipt = if let Some(existing) = store::find_receipt_by_key(repo, run_id, &key)? {
             // Same command over the same tree — reuse the proof, do not re-run.
             log.append(
                 kind::RECEIPT_REUSED,
@@ -422,12 +493,14 @@ pub fn verify_inner(
                 timeout_ms: VERIFY_TIMEOUT_MS,
                 artifact_dir: &store::artifacts_dir(repo, run_id),
                 key: &key,
+                home: &store::sandbox_home(repo),
             })?;
             let output = json!({
                 "exit_code": res.exit_code,
                 "timed_out": res.timed_out,
                 "duration_ms": res.duration_ms,
                 "argv": res.argv,
+                "program_path": res.program_path,
                 "stdout_artifact": rel(repo, &res.stdout_path),
                 "stderr_artifact": rel(repo, &res.stderr_path),
                 "stdout_bytes": res.stdout_bytes,
@@ -479,7 +552,10 @@ pub fn verify_inner(
     }
 
     state.commands_passed = passed;
-    state.verified = passed == required.len() && failures.is_empty();
+    // `!required.is_empty()` is defense in depth: `begin` already rejects a
+    // zero-command goal, but a hand-crafted `goal.json` must never let an empty
+    // requirement set make `passed == required.len()` vacuously true.
+    state.verified = !required.is_empty() && passed == required.len() && failures.is_empty();
     if state.verified {
         state.guard_phase = "verified".into();
         state.verified_digest = digest;
@@ -512,7 +588,7 @@ pub fn commit(repo: &Path, run_id: &str) -> io::Result<GuardOutcome> {
         for path in &out_of_scope {
             log.append(
                 kind::SCOPE_VIOLATION,
-                json!({ "path": path, "allowed": spec.allow.fs_write }),
+                scope_violation(&head, path, &spec.allow.fs_write),
             )?;
         }
         state.out_of_scope = out_of_scope.len();
@@ -620,6 +696,7 @@ pub fn replay(repo: &Path, run_id: &str, rerun: bool) -> io::Result<crate::runti
                 timeout_ms: VERIFY_TIMEOUT_MS,
                 artifact_dir: &store::artifacts_dir(repo, run_id),
                 key: &format!("replay_{key}"),
+                home: &store::sandbox_home(repo),
             })?;
             if res.exit_code == Some(0) && !res.timed_out {
                 passed += 1;
@@ -644,8 +721,9 @@ pub fn replay(repo: &Path, run_id: &str, rerun: bool) -> io::Result<crate::runti
     }
 
     // Consistency replay: the recorded verified bit must match what the recorded
-    // receipts say, and the terminal status must follow.
-    let receipts = store::list_receipts(repo, run_id);
+    // receipts say, and the terminal status must follow. Strict read — a corrupt
+    // receipt blocks the replay rather than silently skewing the derived verdict.
+    let receipts = store::list_receipts_strict(repo, run_id)?;
     let required = spec.required_commands();
     let passed = required
         .iter()
@@ -855,5 +933,109 @@ mod tests {
         let out = commit(r.path(), &id).unwrap();
         assert!(!out.ok, "stale verify must not commit");
         assert!(out.reason.unwrap().contains("tree changed"));
+    }
+
+    #[test]
+    fn begin_rejects_goal_with_no_required_command() {
+        let r = TempRepo::new("nocmd");
+        r.write("Cargo.toml", "[package]\nname=\"x\"\n");
+        // Declares fs.write but no `command(...).passes` — nothing proves success.
+        r.write(
+            "Tachfile",
+            "goal NoCmd -> Success {\n  budget {\n    steps: 40\n  }\n  \
+             allow {\n    fs.write [\"src/**\"]\n    shell.run [\"sh check.sh\"]\n  }\n  \
+             require {\n    no_out_of_scope_writes\n  }\n}\n",
+        );
+        let err = begin(r.path(), None).unwrap_err();
+        assert!(
+            err.to_string().contains("command"),
+            "begin must reject an evidence-free coding goal: {err}"
+        );
+    }
+
+    #[test]
+    fn begin_rejects_goal_with_no_fs_write() {
+        let r = TempRepo::new("nowrite");
+        r.write("Cargo.toml", "[package]\nname=\"x\"\n");
+        // Declares a required command but no fs.write scope — no ambient authority.
+        r.write(
+            "Tachfile",
+            "goal NoWrite -> Success {\n  budget {\n    steps: 40\n  }\n  \
+             allow {\n    shell.run [\"sh check.sh\"]\n  }\n  \
+             require {\n    command(\"sh check.sh\").passes\n  }\n}\n",
+        );
+        let err = begin(r.path(), None).unwrap_err();
+        assert!(
+            err.to_string().contains("fs.write"),
+            "begin must reject a coding goal with no write scope: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_never_passes_with_zero_required_commands() {
+        // Defense in depth: even if a goal.json is hand-crafted past `begin` with no
+        // required commands, `verify` must never report verified=true.
+        let r = TempRepo::new("zerocmd");
+        scaffold(&r, true);
+        let id = begin(r.path(), None).unwrap().run_id;
+        let mut record = store::load_goal(r.path(), &id).unwrap();
+        record.spec.require.retain(|c| !c.starts_with("command:"));
+        store::save_goal(r.path(), &id, &record).unwrap();
+        let s = verify(r.path(), &id, false).unwrap();
+        assert!(
+            !s.verified,
+            "no required commands must never read as verified"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn newly_added_symlink_under_scope_is_rejected() {
+        use std::os::unix::fs::symlink;
+        let r = TempRepo::new("symlink_new");
+        scaffold(&r, true);
+        let id = begin(r.path(), None).unwrap().run_id;
+        // Agent adds a symlink inside writable scope pointing outside the repo — a
+        // write-through vector Tach never follows.
+        symlink("../secret.txt", r.path().join("src/outside")).unwrap();
+        let d = diff(r.path(), &id).unwrap();
+        assert!(
+            d.out_of_scope.contains(&"src/outside".to_string()),
+            "symlink under fs.write must be flagged: {:?}",
+            d.out_of_scope
+        );
+        assert!(d.rejected);
+        assert!(!verify(r.path(), &id, false).unwrap().verified);
+        assert!(!commit(r.path(), &id).unwrap().ok);
+        let events = read_all(&store::events_path(r.path(), &id)).unwrap();
+        assert!(
+            events.iter().any(|e| e.kind == kind::SCOPE_VIOLATION
+                && e.payload.get("reason").and_then(|v| v.as_str()) == Some("symlink")),
+            "violation must name the symlink reason"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preexisting_symlink_under_scope_blocks_verify() {
+        use std::os::unix::fs::symlink;
+        // The dangerous case: a symlink that existed *before* the session. Its target
+        // path never changes, so it never appears in the diff — yet a write through it
+        // lands outside the gate's view. The gate must still reject it.
+        let r = TempRepo::new("symlink_pre");
+        scaffold(&r, true);
+        symlink("../secret.txt", r.path().join("src/outside")).unwrap();
+        let id = begin(r.path(), None).unwrap().run_id;
+        let d = diff(r.path(), &id).unwrap();
+        assert!(
+            d.added.is_empty() && d.modified.is_empty(),
+            "unchanged link should be absent from the diff"
+        );
+        assert!(
+            d.out_of_scope.contains(&"src/outside".to_string()),
+            "pre-existing symlink under scope must still be rejected"
+        );
+        assert!(d.rejected);
+        assert!(!verify(r.path(), &id, false).unwrap().verified);
     }
 }

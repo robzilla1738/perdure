@@ -126,9 +126,16 @@ impl EventLog {
     }
 
     /// Re-open an existing log to continue appending, picking up the sequence
-    /// number right after the last recorded event. Used by `resume`.
+    /// number right after the last recorded event. Used by `resume`. Reads
+    /// strictly: a corrupt history is a hard error, not a silent reset to seq 1 —
+    /// resuming onto a log we couldn't fully parse would mis-number and could
+    /// clobber the durable record the whole resume story depends on.
     pub fn resume(path: &Path, run_id: &str) -> io::Result<Self> {
-        let existing = read_all(path).unwrap_or_default();
+        let existing = match read_all_strict(path) {
+            Ok(events) => events,
+            Err(ref e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e),
+        };
         let next_seq = existing.iter().map(|e| e.seq).max().unwrap_or(0) + 1;
         Ok(EventLog {
             path: path.to_path_buf(),
@@ -161,7 +168,8 @@ impl EventLog {
     }
 }
 
-/// Read an entire event log back into memory, skipping any unparseable line.
+/// Read an entire event log back into memory, skipping any unparseable line. Lossy
+/// by design — for best-effort inspect/audit/display only, never for resume.
 pub fn read_all(path: &Path) -> io::Result<Vec<Event>> {
     let text = fs::read_to_string(path)?;
     Ok(text
@@ -169,4 +177,81 @@ pub fn read_all(path: &Path) -> io::Result<Vec<Event>> {
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str::<Event>(l).ok())
         .collect())
+}
+
+/// Strict twin of [`read_all`]: any non-empty line that fails to parse is an error
+/// (`InvalidData`). Used by resume/replay, where a corrupt history must block the
+/// run rather than be silently truncated.
+pub fn read_all_strict(path: &Path) -> io::Result<Vec<Event>> {
+    let text = fs::read_to_string(path)?;
+    let mut events = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event = serde_json::from_str::<Event>(line).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("corrupt event at {}:{}: {e}", path.display(), i + 1),
+            )
+        })?;
+        events.push(event);
+    }
+    Ok(events)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn tmp_log(tag: &str) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "tach_evt_{}_{}_{}.jsonl",
+            std::process::id(),
+            tag,
+            n
+        ));
+        let _ = fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn strict_read_rejects_a_corrupt_line_and_resume_blocks() {
+        let path = tmp_log("corrupt");
+        let mut log = EventLog::create(&path, "run_x").unwrap();
+        log.append("test.event", serde_json::json!({ "ok": true }))
+            .unwrap();
+        // A garbage line appended after a valid one (disk/edit corruption).
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{{not json").unwrap();
+        drop(f);
+
+        // Lossy read silently skips the bad line; strict read refuses it; and a
+        // resume must block rather than reset the sequence and clobber history.
+        assert_eq!(
+            read_all(&path).unwrap().len(),
+            1,
+            "lossy read skips garbage"
+        );
+        assert!(
+            read_all_strict(&path).is_err(),
+            "strict read errors on garbage"
+        );
+        assert!(
+            EventLog::resume(&path, "run_x").is_err(),
+            "resume must block on a corrupt log"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resume_on_a_missing_log_starts_fresh() {
+        // A never-written log is "no history yet", not corruption.
+        let path = tmp_log("missing");
+        let log = EventLog::resume(&path, "run_x").unwrap();
+        assert_eq!(log.peek_seq(), 1);
+    }
 }
