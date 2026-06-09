@@ -1,0 +1,8 @@
+# Paths the Perdure scope/diff gate ignores.
+target
+node_modules
+dist
+build
+.venv
+__pycache__
+*.log

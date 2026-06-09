@@ -21,10 +21,19 @@ A file is a sequence of items.
 
 ```perdure
 import db
+import "./billing.pdr"
+import "../src/auth.pdr"
 ```
 
-Brings a builtin module into scope. Using a module without importing it is an error
-(`E0322`) with a patch that inserts the missing `import`.
+A bare name brings a **builtin module** into scope; using one without importing it is an
+error (`E0322`) with a patch that inserts the missing `import`. A quoted path is a
+**file import**: it grants this file visibility into another file's functions and types.
+Visibility, not loading — the workspace is still one merged compilation unit at runtime;
+imports gate which names a file may *reference*. Paths are relative to the importing
+file, must stay inside the workspace (`E0471`), must exist (`E0470`), and may not form a
+cycle (`E0472`). Visibility is transitive: importing a file vouches for what it imports.
+Using another file's symbol without importing it is `E0473` with a patch that inserts
+the canonical relative spelling — `perdure fix` applies it.
 
 ### `type`
 
@@ -267,15 +276,62 @@ loop that makes no tool call and so can only spin against the iteration limit (`
 run starts, the goal's source is snapshotted into the run record; resume and replay re-parse that
 frozen snapshot, never the live file, so editing the source mid-run can't change a run in flight.
 
+### Real tools in plans
+
+Beyond the deterministic `fake.*` catalog, a plan can run real commands and call real
+APIs. Authority comes from the goal's `allow` block and is default-deny:
+
+```perdure
+goal ReleaseSmoke -> Success {
+  budget {
+    steps: 10
+    time: 15m                                  // wall-clock budget, ENFORCED for plan runs
+  }
+  allow {
+    shell.run ["cargo test"]                   // exact-match command list
+    http.get "https://api.example.com/**"      // URL globs, https unless the glob says http://
+    http.post ["https://api.example.com/v1/deployments"]
+  }
+  plan {
+    let tests = call shell.run { cmd: "cargo test", timeout_ms: 300000 }
+    if tests.ok {
+      call http.post {
+        url: "https://api.example.com/v1/deployments"
+        body: "ref=main"
+        headers: { content_type: "application/x-www-form-urlencoded" }
+        headers_env: { authorization: "DEPLOY_TOKEN" }   // env-var NAME, never the value
+      }
+    }
+  }
+}
+```
+
+`shell.run` returns `{ ok, exit_code, timed_out, duration_ms, argv, program_path,
+stdout (capped inline), stdout_bytes, stderr_bytes, stdout_artifact, stderr_artifact }`.
+`http.get`/`http.post` return `{ ok, status, headers, body (capped inline), body_bytes,
+body_artifact, duration_ms, headers_env_resolved }`. A nonzero exit or non-2xx status is
+an `ok:false` value the plan branches on, not a run failure. An ungranted command or URL
+is refused before anything fires (`authority.denied` on the ledger; `E0438` at check
+time for literal commands). A literal credential header is `E0439 secret_in_source` —
+use `headers_env`, whose values are read from the environment at call time and never
+recorded. Completed calls are memoized by receipt (exactly-once across crash/resume;
+every POST carries an `Idempotency-Key`), and `goal replay` re-walks from receipts
+without re-firing anything.
+
 ## Formatting
 
 There is **one formatter**. `perdure fmt` renders any file to a single canonical style
-(2-space indent, multi-line records and `match` arms, canonical spacing); it is
-deterministic and idempotent, and only parenthesizes a subexpression when dropping the
-parens would change the parse. `perdure fmt --check` writes nothing and exits non-zero if
-anything would change — the CI gate. The formatter never reformats a file it can't render
-losslessly: files with syntax errors or comments are left untouched (comment-preserving
-formatting is a planned follow-up).
+(2-space indent, multi-line records and `match` arms, canonical spacing, adjacent
+imports grouped into one block); it is deterministic and idempotent, and only
+parenthesizes a subexpression when dropping the parens would change the parse.
+`perdure fmt --check` writes nothing and exits non-zero if anything would change — the
+CI gate.
+
+**Comments are preserved.** A leading comment renders directly above the item,
+statement, or record field that follows it; a trailing comment stays on the line it
+annotates; a comment with no per-line anchor (inside an expression, or inside a goal's
+budget/allow/require sections) surfaces on the nearest following line rather than being
+dropped. No comment is ever lost; only files with syntax errors are left untouched.
 
 ## Diagnostics you'll meet
 
@@ -298,6 +354,12 @@ formatting is a planned follow-up).
 | `E0434` | `unknown_tool` | rename to the nearest known tool (did-you-mean) |
 | `E0435` | `unbound_plan_var` | bind the variable (a `let` or a `for`) before using it |
 | `E0436` | `unsupported_plan_expr` | use a form a plan expression can evaluate |
+| `E0438` | `command_ungranted` | add the literal command to `allow { shell.run [...] }` |
+| `E0439` | `secret_in_source` | move the credential header into `headers_env` |
+| `E0470` | `import_not_found` | point the file import at a file that exists |
+| `E0471` | `import_outside_workspace` | keep file imports inside the workspace |
+| `E0472` | `import_cycle` | break the cycle via a shared importable file |
+| `E0473` | `symbol_not_imported` | insert the missing file import (patch applies) |
 | `E0437` | `unbounded_plan_loop` (warning) | call a tool inside the loop so it makes progress |
 
 The mechanical code diagnostics each carry a `preferred_patch` so `perdure fix` can apply them

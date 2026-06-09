@@ -1,0 +1,13 @@
+goal FixFailingTests -> Success {
+  budget {
+    steps: 40
+  }
+  allow {
+    fs.write ["src/**", "tests/**"]
+    shell.run "cargo test"
+  }
+  require {
+    command("cargo test").passes
+    no_out_of_scope_writes
+  }
+}

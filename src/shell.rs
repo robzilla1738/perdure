@@ -89,11 +89,12 @@ pub fn allowed_env_names() -> &'static [&'static str] {
             "USERPROFILE",
             "TEMP",
             "TMP",
+            "RUSTUP_HOME",
         ]
     }
     #[cfg(not(windows))]
     {
-        &["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"]
+        &["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "RUSTUP_HOME"]
     }
 }
 
@@ -120,6 +121,27 @@ pub fn child_env(home: &Path) -> Vec<(String, String)> {
     env.push(("USERPROFILE".to_string(), home));
     #[cfg(not(windows))]
     let _ = home;
+
+    // Rustup resolves its toolchain store through $HOME, which the sandbox
+    // override just broke — on a rustup-managed machine the `cargo` shim would
+    // fail with "no default toolchain" and every Rust repo's verify would be
+    // dead on arrival (found by dogfooding the guard on this very repo). When
+    // the parent doesn't set RUSTUP_HOME explicitly, derive it from the REAL
+    // home. ~/.rustup holds compilers and settings, no credentials — unlike
+    // CARGO_HOME (~/.cargo/credentials.toml), which deliberately stays under
+    // the sandbox home.
+    if !env.iter().any(|(k, _)| k == "RUSTUP_HOME") {
+        let real_home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"));
+        if let Ok(rh) = real_home {
+            let rustup = Path::new(&rh).join(".rustup");
+            if rustup.is_dir() {
+                env.push((
+                    "RUSTUP_HOME".to_string(),
+                    rustup.to_string_lossy().into_owned(),
+                ));
+            }
+        }
+    }
     env
 }
 
@@ -334,6 +356,47 @@ fn join_drain(handle: Option<DrainHandle>) -> io::Result<u64> {
             .join()
             .map_err(|_| io::Error::other("output capture thread panicked"))?,
         None => Ok(0),
+    }
+}
+
+#[cfg(test)]
+mod rustup_tests {
+    use super::*;
+
+    #[test]
+    fn rustup_home_is_derived_from_the_real_home_when_present() {
+        // On a machine with ~/.rustup, the child env must carry RUSTUP_HOME
+        // even though HOME is sandboxed — otherwise the cargo shim cannot
+        // resolve a toolchain and every Rust repo's verify fails.
+        let tmp = std::env::temp_dir().join("perdure_sbx_home_test");
+        let env = child_env(&tmp);
+        let real_home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"));
+        let has_rustup = real_home
+            .as_deref()
+            .map(|h| Path::new(h).join(".rustup").is_dir())
+            .unwrap_or(false);
+        let home_val = env
+            .iter()
+            .find(|(k, _)| k == "HOME")
+            .map(|(_, v)| v.clone());
+        assert_eq!(home_val.as_deref(), Some(tmp.to_string_lossy().as_ref()));
+        if has_rustup || std::env::var("RUSTUP_HOME").is_ok() {
+            let rh = env
+                .iter()
+                .find(|(k, _)| k == "RUSTUP_HOME")
+                .map(|(_, v)| v.clone())
+                .expect("RUSTUP_HOME passes through to the child");
+            assert!(
+                !rh.starts_with(tmp.to_string_lossy().as_ref()),
+                "RUSTUP_HOME must point at the real toolchain store, not the sandbox"
+            );
+        }
+        // CARGO_HOME must NOT be smuggled in: ~/.cargo/credentials.toml is
+        // exactly what the sandbox home keeps away from children.
+        assert!(
+            !env.iter().any(|(k, _)| k == "CARGO_HOME"),
+            "CARGO_HOME stays sandbox-derived"
+        );
     }
 }
 

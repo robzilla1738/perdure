@@ -2336,7 +2336,10 @@ fn cmd_explain(rest: &[String]) -> i32 {
     }
 }
 
-const EXPLAINED_CODES: &[&str] = &["E0309", "E0322", "E0421", "E0431", "E0432"];
+const EXPLAINED_CODES: &[&str] = &[
+    "E0309", "E0322", "E0421", "E0431", "E0432", "E0438", "E0439", "E0470", "E0471", "E0472",
+    "E0473",
+];
 
 /// Long-form explanations for the diagnostics an agent (or a human) most often
 /// meets. Each pairs the *why* with the repair the compiler already proposes.
@@ -2376,6 +2379,48 @@ fn explanation(code: &str) -> Option<(&'static str, &'static str)> {
             "A goal declares no `steps` or `retries` budget, so a run could loop without a\n\
              bound. Long-horizon runs must be bounded.\n\n\
              Add a `budget { steps: N }` block (and optionally `retries: N`).",
+        ),
+        "E0438" => (
+            "command_ungranted",
+            "A plan calls `shell.run` with a literal command that is not on the goal's\n\
+             `allow { shell.run [...] }` list. The allowlist is exact-match — no globs,\n\
+             no prefixes — and the runtime refuses an unlisted command before it spawns\n\
+             (authority.denied on the ledger).\n\n\
+             Add the exact command string to the allow list, or call one that is granted.",
+        ),
+        "E0439" => (
+            "secret_in_source",
+            "An http call carries a credential header (authorization, cookie, x-api-key,\n\
+             proxy-authorization) as a literal. A literal would be frozen into the goal\n\
+             source, the receipt input, and the event log.\n\n\
+             Use `headers_env { authorization: \"ENV_VAR_NAME\" }` instead: the value is\n\
+             read from the environment at call time and never recorded anywhere.",
+        ),
+        "E0470" => (
+            "import_not_found",
+            "A file import (`import \"./x.pdr\"`) resolves to a path that is not a file in\n\
+             this workspace.\n\n\
+             Fix the path (imports are relative to the importing file), or create the file.",
+        ),
+        "E0471" => (
+            "import_outside_workspace",
+            "A file import is absolute or climbs out of the workspace root with `..`.\n\
+             File imports can only name files inside the workspace, so a project is\n\
+             self-contained and relocatable.",
+        ),
+        "E0472" => (
+            "import_cycle",
+            "File imports form a cycle (the message names it). Imports grant visibility,\n\
+             and cyclic visibility has no well-defined direction.\n\n\
+             Move the shared definitions into a file both sides can import.",
+        ),
+        "E0473" => (
+            "symbol_not_imported",
+            "This file uses a function or type defined in another file it does not import.\n\
+             File imports are visibility: a file may only reference names from files it\n\
+             (transitively) imports.\n\n\
+             The preferred patch inserts the canonical relative import — `perdure fix`\n\
+             applies it mechanically.",
         ),
         _ => return None,
     })

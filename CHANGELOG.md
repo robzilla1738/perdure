@@ -54,6 +54,16 @@ now perdure** (`.pdr` sources, `Perdurefile`, `.perdure/` state directory,
   import_outside_workspace`, `E0472 import_cycle`, `E0473
   symbol_not_imported`.
 
+### Fixed
+
+- The guard's sandbox `HOME` broke rustup's `cargo` shim ("no default toolchain"),
+  killing verify on every rustup-managed Rust repo. `RUSTUP_HOME` now passes through
+  (derived from the real home when unset) — it holds compilers, not credentials —
+  while `CARGO_HOME` deliberately stays sandboxed. Found by dogfooding the guard on
+  this repo (`docs/DOGFOOD.md`); the failed verify is preserved on that run's ledger.
+- The guard verify timeout was 2 minutes — shorter than a cold first build of a real
+  project. Now 10 minutes.
+
 ### Changed
 
 - Renamed from tach: binary/crate `perdure`, sources `.pdr`, goal file

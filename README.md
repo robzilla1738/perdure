@@ -2,20 +2,23 @@
 
 # Perdure
 
-**A typed goal runtime for long-horizon agents.**
+**Durable, exactly-once execution for agent workflows.**
 
-*The fastest path from a failing goal to a verified result.*
+*Goals with enforced authority, receipts for every effect, crash-safe resume, and replayable history.*
 
 </div>
 
 ---
 
-Perdure gives an agent's goals a **typed, deterministic, auditable control plane**. A goal
-runs with a budget it can't exceed, an authority it can't escape, checkpoints it can
-resume from, an event history that records everything it did, and a verification pipeline
-that refuses any change that breaks the build, regresses a test, or reaches outside the
-scope it was granted. Use Perdure when you want an agent to pursue a goal **without losing
-state, exceeding authority, repeating side effects, or making untraceable changes.**
+Perdure is a small typed language and runtime for work that has to **survive and be
+provable**: long-horizon agent workflows that call real commands and real APIs. A goal
+runs with a budget it can't exceed and an authority it can't escape — an exact-match
+command allowlist, URL globs, file scopes — and every effect commits a durable receipt
+before anything else happens. Crash anywhere and `resume` picks up without repeating a
+side effect; `replay` re-walks the whole run from its receipts, fires nothing, and proves
+the recorded history is the one that happened. Use Perdure when you want an agent to act
+in the world **without losing state, exceeding authority, repeating side effects, or
+making untraceable changes.**
 
 The foundation is a language whose **compiler is also an agent harness**. Most languages
 were designed for humans to write and a machine to run; Perdure is designed for the loop
@@ -269,6 +272,65 @@ change a run already in flight. Each receipt is self-describing for audit: it re
 step it committed at, the effect, a hash of the input, the approval that authorized it, and the
 history event that recorded it (`perdure goal receipt <id> <rcpt>`).
 
+## Real tools: plans that touch the world
+
+The fake tools above make demos deterministic, but plans are not a simulation. A plan can
+run **real commands** and call **real APIs**, and the authority model is the contract:
+
+```text
+goal ReleaseSmoke -> Success {
+  budget {
+    steps: 10
+    time: 15m
+  }
+  allow {
+    shell.run ["cargo test", "cargo build --release"]
+    http.post ["https://api.example.com/v1/deployments"]
+  }
+  plan {
+    let tests = call shell.run { cmd: "cargo test" }
+    if tests.ok {
+      approve "announce the release" {
+        call http.post {
+          url: "https://api.example.com/v1/deployments"
+          body: "ref=main"
+          headers: { content_type: "application/x-www-form-urlencoded" }
+          headers_env: { authorization: "DEPLOY_TOKEN" }
+        }
+      }
+    }
+  }
+}
+```
+
+What the runtime enforces, none of it advisory:
+
+- **Authority before anything fires.** A command must appear *verbatim* in the
+  `shell.run` allowlist; a URL must match the goal's globs (https required unless the
+  glob explicitly grants `http://`; redirects are never followed). A refusal is an
+  `authority.denied` event on the ledger — before any process spawns or socket opens —
+  and the checker catches literal violations at `goal check` time (`E0438`, `E0439`).
+- **Exactly-once across crashes.** Every completed call commits a receipt before the run
+  advances; crash + resume reuses the receipt instead of re-running. Every `http.post`
+  also carries an `Idempotency-Key` derived from the receipt key, so idempotent APIs
+  deduplicate even the crash-after-send window.
+- **Secrets never enter the store.** `headers_env` names an *environment variable*; the
+  value is read at call time, sent on the wire, and never serialized — receipts record
+  the names that were resolved, never the values. A literal `authorization:` header is a
+  compile error that teaches the fix.
+- **Failure is data.** A nonzero exit or a 500 is an `ok:false` output the plan branches
+  on (full stdout/body in `artifacts/`, capped copy inline). Only a spawn or transport
+  failure is a tool error — no receipt, safe to retry.
+- **Replay never re-fires.** `perdure goal replay` re-walks the plan feeding recorded
+  receipt outputs back in, verifies the event hash chain, and reproduces the decision
+  sequence — zero processes, zero requests. A crashed run replays to its exact frontier.
+- **Wall-clock budgets are enforced.** `budget { time: 15m }` is billed from receipt
+  durations — deterministic on resume, no live clock in the control flow.
+
+`perdure new demo --goal shell` scaffolds a runnable real-command workflow;
+`scripts/real_shell_e2e.sh` and `scripts/http_e2e.sh` prove the guarantees end-to-end
+(marker-count exactly-once, secret-grep redaction, zero-spawn replay) on every CI run.
+
 ## The coding harness: govern an external agent on a real repo
 
 Everything above operates on Perdure's own language. The **coding harness** turns the same
@@ -277,6 +339,12 @@ existing Rust / JS / Go / Python repo edited by an external agent (Claude Code, 
 Cursor). Perdure does not replace those agents. It makes their work scoped, verified,
 replayable, and auditable. *The agent brings the reasoning; Perdure is the guardrail and the
 ledger.*
+
+**We run it on this repo.** Perdure's own development is guarded by Perdure: the repo
+carries its `Perdurefile`, and [`docs/DOGFOOD.md`](docs/DOGFOOD.md) walks the audited
+session — including the moment dogfooding caught a real bug (the sandbox `HOME` broke
+rustup's toolchain resolution) with the failed verify preserved on the hash-chained
+ledger.
 
 ```bash
 cd some-existing-repo
@@ -481,17 +549,23 @@ Perdure race · 3 branches, isolated
 Because every run is deterministic, `perdure trace` and `perdure replay` re-open and reproduce
 any loop exactly.
 
-## Install / build
+## Install
 
-Requires a Rust toolchain (1.75+).
+Prebuilt binaries (macOS arm64/x86_64, Linux x86_64, Windows) ship with every release:
 
 ```console
-$ git clone <this-repo> perdure && cd perdure
-$ cargo build --release
-$ ./target/release/perdure --help
+$ curl -fsSL https://raw.githubusercontent.com/robzilla1738/perdure/main/install.sh | sh
 ```
 
-The result is a single static binary. Put `target/release/perdure` on your `PATH`.
+Or with a Rust toolchain (1.82+):
+
+```console
+$ cargo install perdure
+```
+
+Or from source: `git clone … && cargo build --release` — the result is a single static
+binary. Editor support: `editors/vscode` ships a VS Code extension (syntax highlighting +
+`perdure check` squiggles on save); package it with `npx @vscode/vsce package`.
 
 ## Commands
 
@@ -641,28 +715,41 @@ serve-mcp`** (no raw shell, no arbitrary file writes; Perdure embeds no model). 
 coder seam (`perdure fix --coder fixture`) whose proposals still go through the exact same pipeline;
 `perdure fmt` gives one canonical, idempotent style; `perdure schema` publishes versioned JSON schemas for
 every machine output (including `approval`, `receipt`, `guard-audit`, and `agent-context`); and
-`perdure doctor` / `perdure explain` round out the toolchain. **160 passing tests** plus end-to-end checks
+`perdure doctor` / `perdure explain` round out the toolchain. **206 passing tests** plus end-to-end checks
 (red→green, crash→resume→replay, the approval/refund/receipt demo, the loop/approval/crash plan demo,
 a user-authored plan goal that resumes off its source snapshot, the coding harness adopting a real
 repo and rejecting an out-of-scope edit, power-loss torn-write recovery, ledger tamper-detection, and
-the agent-interface + MCP-server surface) and a schema-validation step in CI.
+the agent-interface + MCP-server surface, real-command plans proving authority/exactly-once/zero-spawn
+replay, and an HTTP workflow against a logging stub proving URL authority, secret redaction, and
+zero-request replay) and a schema-validation step in CI.
 
-**Near-term follow-ups (the roadmap the runtime is built for):** real tool integrations behind
-the fake-tool seam, typed memory lanes with a context-drift detector, a scenario DSL that turns
-the shell e2es into Perdure-native long-horizon regression tests, a research ledger
-(source/evidence/claim/fact/citation), MCP **client/import** (the server already ships), and a
+**Real as of 0.2.0-alpha.1:** plans execute **real tools** — `shell.run` under an
+exact-match command allowlist and `http.get`/`http.post` under URL-glob authority, with
+receipts, `Idempotency-Key`s, env-sourced secrets that never enter the store,
+`authority.denied` ledger refusals, enforced wall-clock budgets, and replay-from-receipts
+that never re-fires an effect. **Multi-file imports** (`import "./billing.pdr"`, with
+repairable `E0473` diagnostics that `perdure fix` applies). A **comment-preserving
+formatter**. **Distribution**: prebuilt binaries for macOS/Linux/Windows on every tag,
+`install.sh`, and the crate on crates.io. A **VS Code extension** (highlighting +
+check-on-save diagnostics) under `editors/vscode`.
+
+**Near-term follow-ups (the roadmap the runtime is built for):** a scenario DSL that turns
+the shell e2es into Perdure-native long-horizon regression tests, typed memory lanes with a
+context-drift detector, a research ledger (source/evidence/claim/fact/citation), MCP
+**client/import** (the server already ships) so plans can call any MCP tool durably, and a
 portable goal ABI. The event log, durable store, authority model, and the approval/receipt
-substrate are exactly what those phases hang off. (User-authored plan goals — write a `plan` block
-in your own workspace and `run`/`check`/`resume`/`replay` it off a source snapshot — already work.)
-Also: multi-file user
-imports and comment-preserving formatting.
+substrate are exactly what those phases hang off.
 
 **Deliberately scoped out:** native/LLVM codegen (today it interprets), a borrow checker,
-a package manager, an LSP server, and a *model-backed* coder. The loop already has the
+a package manager, a full LSP server, and a *model-backed* coder. The loop already has the
 seam — a `Coder` trait, exercised offline by a deterministic fixture coder — so a real
 model slots in behind a flag later, with every model output flowing through the same
 patch/effect/test/authority pipeline. The core demo and the whole test suite stay
 model-free, so everything is fully reproducible offline.
+
+See [`THREAT_MODEL.md`](THREAT_MODEL.md) for exactly what is enforced versus detected, and
+[`EXTERNAL_AGENTS.md`](EXTERNAL_AGENTS.md) for the operating contract an external coding
+agent (Claude Code, Codex, Cursor) gets through `perdure guard` and `perdure serve-mcp`.
 
 ## Testing
 

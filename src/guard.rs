@@ -37,7 +37,10 @@ use std::path::Path;
 
 /// Wall-clock ceiling for a single verified command. Generous enough for a real
 /// `cargo test`, short enough that a hung command can't wedge a session.
-const VERIFY_TIMEOUT_MS: u64 = 120_000;
+/// Generous on purpose: a real repo's first verify may cold-build (the
+/// sandboxed CARGO_HOME starts empty), and a timeout that kills a legitimate
+/// test suite teaches adopters to bypass the guard. Found by dogfooding.
+const VERIFY_TIMEOUT_MS: u64 = 600_000;
 
 /// A test-only crash hook for `verify`, mirroring `runtime::ActionCrash`. Crashes
 /// right after the `n`th command receipt is durable but before the `verified` bit
