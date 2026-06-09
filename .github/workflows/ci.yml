@@ -52,7 +52,7 @@ jobs:
       - name: End-to-end user-authored plan goal (scaffold → check → crash → snapshot-beats-live-edit → replay)
         run: bash scripts/user_plan_e2e.sh
 
-      - name: End-to-end guard (existing repo: adopt → verify → crash/resume → commit → out-of-scope reject → replay)
+      - name: "End-to-end guard (existing repo: adopt → verify → crash/resume → commit → out-of-scope reject → replay)"
         run: bash scripts/guard_e2e.sh
 
       - name: Tach format check (corpus)
