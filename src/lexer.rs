@@ -55,6 +55,14 @@ pub fn lex(file: &str, src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                 let mut closed = false;
                 while i < n {
                     let (_, ch) = chars[i];
+                    if ch == '\n' {
+                        // A string literal is single-line. A newline before the closing
+                        // quote means it is unterminated — stop here rather than swallow
+                        // the rest of the file, so the newline still separates statements
+                        // and the cascade stays one line instead of erasing the source
+                        // below it. `closed` stays false → the E0001 below fires.
+                        break;
+                    }
                     if ch == '\\' && i + 1 < n {
                         let (_, esc) = chars[i + 1];
                         match esc {
@@ -110,10 +118,38 @@ pub fn lex(file: &str, src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                 }
                 let text: String = chars[i..j].iter().map(|(_, ch)| *ch).collect();
                 let span = Span::new(start, end_off(j));
+                // A literal that overflows its type must be an *error*, never a silent
+                // `0`: an agent editing Tach would have no idea its `1_0000000000…`
+                // became zero, and a miscompiled constant is exactly the kind of quiet
+                // wrong-answer this language exists to make impossible.
                 let kind = if is_float {
-                    Tok::Float(text.parse().unwrap_or(0.0))
+                    match text.parse::<f64>() {
+                        Ok(f) if f.is_finite() => Tok::Float(f),
+                        _ => {
+                            diags.push(Diagnostic::error(
+                                "E0002",
+                                "number_out_of_range",
+                                format!("float literal `{text}` is out of range for Float (f64)"),
+                                file,
+                                span,
+                            ));
+                            Tok::Float(0.0)
+                        }
+                    }
                 } else {
-                    Tok::Int(text.parse().unwrap_or(0))
+                    match text.parse::<i64>() {
+                        Ok(n) => Tok::Int(n),
+                        Err(_) => {
+                            diags.push(Diagnostic::error(
+                                "E0002",
+                                "number_out_of_range",
+                                format!("integer literal `{text}` is out of range for Int (i64)"),
+                                file,
+                                span,
+                            ));
+                            Tok::Int(0)
+                        }
+                    }
                 };
                 toks.push(Token { kind, span });
                 i = j;
@@ -226,4 +262,42 @@ fn is_ident_start(c: char) -> bool {
 
 fn is_ident_cont(c: char) -> bool {
     c == '_' || c.is_ascii_alphanumeric()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_int_literal_is_an_error_not_a_silent_zero() {
+        // The headline correctness fix: an out-of-range literal must be flagged, never
+        // silently miscompiled to 0 (which an agent editing Tach would never notice).
+        let (_t, diags) = lex("t.tach", "fn f() { return 99999999999999999999999999 }");
+        assert!(
+            diags.iter().any(|d| d.code == "E0002"),
+            "overflowing int literal must emit E0002, got {diags:?}"
+        );
+        // A valid (in-range) i64 still lexes to its exact value, no false positive.
+        let (toks, diags) = lex("t.tach", "fn f() { return 9000000000000000000 }");
+        assert!(diags.iter().all(|d| d.code != "E0002"));
+        assert!(toks
+            .iter()
+            .any(|t| matches!(t.kind, Tok::Int(9_000_000_000_000_000_000))));
+    }
+
+    #[test]
+    fn unterminated_string_does_not_swallow_the_rest_of_the_file() {
+        // The unclosed string must stop at the newline, so `let y = 5` below still
+        // lexes (an Int 5 appears) instead of being eaten as string bytes.
+        let src = "fn f() {\n  let s = \"oops\n  let y = 5\n}\n";
+        let (toks, diags) = lex("t.tach", src);
+        assert!(
+            diags.iter().any(|d| d.code == "E0001"),
+            "unterminated string must be flagged"
+        );
+        assert!(
+            toks.iter().any(|t| matches!(t.kind, Tok::Int(5))),
+            "code after the unterminated string must still lex"
+        );
+    }
 }

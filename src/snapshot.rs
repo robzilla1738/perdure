@@ -176,8 +176,31 @@ impl Ignore {
     }
 
     /// Does any ignore pattern (default or `.tachignore`) match this path?
+    ///
+    /// Two files are **never** ignored, at any depth: `.tachignore` and `.gitignore`.
+    /// They *define* the gate's blind spots — `.tachignore` what the scope gate skips,
+    /// `.gitignore` what a human will commit — so a silent edit to either is exactly
+    /// what an audit must see. Refusing to ignore them means an agent can't shrink the
+    /// gate's view by editing the very file that configures it (belt-and-suspenders to
+    /// the frozen baseline, which already pins the rules captured at `begin`).
     pub fn matches(&self, rel: &str) -> bool {
+        let base = rel.rsplit('/').next().unwrap_or(rel);
+        if matches!(base, ".tachignore" | ".gitignore") {
+            return false;
+        }
         self.globs.iter().any(|g| glob_match(g, rel))
+    }
+
+    /// The resolved glob set, for **freezing** into a run's baseline so every later
+    /// scope diff classifies against the rules captured at `begin` — never a live,
+    /// agent-editable `.tachignore`. Round-trips through [`Ignore::from_globs`].
+    pub fn globs(&self) -> &[String] {
+        &self.globs
+    }
+
+    /// Reconstruct an `Ignore` from a frozen glob set (see [`Ignore::globs`]).
+    pub fn from_globs(globs: Vec<String>) -> Self {
+        Ignore { globs }
     }
 }
 
@@ -189,15 +212,15 @@ fn is_hard_excluded_dir(name: &str) -> bool {
     matches!(name, ".git" | ".tach")
 }
 
-/// FNV-1a (64-bit) hex digest of a byte string — the same mixer the store uses for
-/// its deterministic ids, so the whole system speaks one hash.
+/// SHA-256 hex digest of a file's bytes — a **cryptographic** hash, deliberately not
+/// the FNV mixer the store uses for addressing ids. The scope gate's honesty rests on
+/// this: against an adversarial agent, a content hash must resist a *crafted*
+/// collision, or an out-of-scope edit could be made to hash equal to the baseline and
+/// the diff would read it as "unmodified" and never flag it. FNV-1a is linear and
+/// trivially collidable; SHA-256 is not. (See `crate::hash`.) Folds into
+/// `ManifestEntry::signature`, the tree digest, and thus the verify idempotency key.
 pub fn content_hash(bytes: &[u8]) -> String {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in bytes {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    format!("{h:016x}")
+    crate::hash::sha256_hex(&[bytes])
 }
 
 /// Whether `p` has any execute bit set. Unix-only signal; `false` elsewhere.

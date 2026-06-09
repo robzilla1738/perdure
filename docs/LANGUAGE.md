@@ -113,8 +113,14 @@ fn describe(p: Parity) -> String {
 ```
 
 A `match` on an enum must cover every variant (or use `_`); the checker offers a patch to
-add any missing arm. Naming a variant the enum doesn't declare is an error with a
-did-you-mean suggestion.
+add any missing arm. This one patch is special: its arm body is a **placeholder** (a copy
+of the first arm's expression — the only generically type-correct value available), so it
+makes the match compile and exhaustive but does *not* synthesize the right behavior for the
+new variant. The diagnostic flags it as a placeholder to replace, and the verify pipeline is
+a backstop — a placeholder that regresses a test is rejected, so the repair loop never greens
+on a wrong body a test actually covers. (Every *other* mechanical patch is semantically
+complete; this is the lone exception, and it is labeled as such.) Naming a variant the enum
+doesn't declare is an error with a did-you-mean suggestion.
 
 ## Builtin modules and effects
 
@@ -275,6 +281,8 @@ formatting is a planned follow-up).
 
 | Code | Kind | Fix it offers |
 | --- | --- | --- |
+| `E0001` | `syntax` (lexer) | — (e.g. an unterminated string; no autofix) |
+| `E0002` | `number_out_of_range` (lexer) | — (a literal that overflows `Int`/`Float`; reported, never silently truncated to `0`) |
 | `E0322` | `unknown_module` | insert the missing `import` |
 | `E0421` | `effect_undeclared` | add/extend the `effects [...]` clause |
 | `E0450` | `effect_unused` (warning) | trim effects the function doesn't perform |

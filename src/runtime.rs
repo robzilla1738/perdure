@@ -205,6 +205,10 @@ pub fn start_run(
 /// checkpoint, continuing the same event log.
 pub fn resume_run(repo: &Path, run_id: &str, crash_after: Option<u64>) -> io::Result<RunResult> {
     let record = store::load_goal(repo, run_id)?;
+    // One resumer at a time: held across the whole resume (and its dispatched
+    // action/plan re-execution), so two concurrent resumes can't both replay the plan
+    // and double-invoke a tool whose receipt neither has written yet.
+    let _lock = store::RunLock::acquire(repo, run_id)?;
     if record.kind == "coding" {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -900,10 +904,11 @@ pub fn replay_action_run(repo: &Path, run_id: &str) -> io::Result<ReplayResult> 
         )
     })?;
     let recorded = store::load_state(repo, run_id)?;
-    let recorded_receipts: BTreeMap<String, serde_json::Value> = store::list_receipts(repo, run_id)
-        .into_iter()
-        .map(|r| (r.idempotency_key, r.output))
-        .collect();
+    let recorded_receipts: BTreeMap<String, serde_json::Value> =
+        store::list_receipts_strict(repo, run_id)?
+            .into_iter()
+            .map(|r| (r.idempotency_key, r.output))
+            .collect();
 
     let step_budget = spec.step_budget();
     let tools = spec.allowed_tools();
@@ -1386,7 +1391,11 @@ fn drive_plan(
     crash: Option<ActionCrash>,
 ) -> io::Result<RunResult> {
     let run_id = state.run_id.clone();
-    let baseline = store::list_receipts(repo, &run_id).len() as u64;
+    // Strict: a corrupt receipt at the walk's start would otherwise undercount the
+    // baseline, shift every `call_index`, shift every idempotency key, and re-run a
+    // completed effect. A damaged proof must block the run, never read as "fewer
+    // receipts" — the same posture replay and the event log already take.
+    let baseline = store::list_receipts_strict(repo, &run_id)?.len() as u64;
     let mut ctx = PlanCtx {
         repo,
         run_id,
@@ -1746,7 +1755,7 @@ pub fn replay_plan_run(repo: &Path, run_id: &str) -> io::Result<ReplayResult> {
     let plan_block = resolve_plan(&record)?;
     let spec = record.spec;
     let recorded = store::load_state(repo, run_id)?;
-    let recorded_receipts: BTreeMap<String, Value> = store::list_receipts(repo, run_id)
+    let recorded_receipts: BTreeMap<String, Value> = store::list_receipts_strict(repo, run_id)?
         .into_iter()
         .map(|r| (r.idempotency_key, r.output))
         .collect();

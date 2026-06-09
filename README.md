@@ -125,8 +125,9 @@ $ tach goal replay run_69c04fc4d55f672e
   ● replay reproduced the run exactly — 3 step(s), completed
 ```
 
-Everything the run did is an immutable line in an append-only log
-(`.tach/goals/<id>/events.jsonl`, schema `tach.event.v1`):
+Everything the run did is a line in an append-only, **hash-chained** log
+(`.tach/goals/<id>/events.jsonl`, schema `tach.event.v2`) — each event commits to the one
+before it, so any later edit is detectable (`tach guard audit`):
 
 ```console
 $ tach goal inspect run_69c04fc4d55f672e
@@ -284,6 +285,7 @@ tach guard begin FixFailingTests
 #   … the agent reads `tach guard context --json` and edits files …
 tach guard verify               # runs the real test command; captures a receipt; sets verified
 tach guard finalize             # finalizes only if verified — and only in Tach's ledger, never git
+tach guard audit                # (operator/CI) prove the ledger wasn't tampered: chain + receipts + verified bit
 ```
 
 The `Tachfile` is the contract: a goal in the same grammar, scoped to a real tree.
@@ -306,10 +308,16 @@ goal FixFailingTests -> Success {
 
 What Tach guarantees across a session:
 
-- **Scope gate.** `begin` snapshots the working tree; `verify`/`commit` diff against it and
-  reject any change outside the `fs.write` globs. Without a sandbox Tach can't *prevent* the
-  write — it is an honest detect-and-reject gate: the violation lands in `events.jsonl` and
-  the commit is blocked.
+- **Scope gate.** `begin` snapshots the working tree and **freezes the ignore set**;
+  `verify`/`commit` diff against that baseline (using SHA-256 content hashes, so a change can't be
+  crafted to hash equal to the original) and reject any change outside the `fs.write` globs. The
+  ignore rules are fixed at `begin` and `.tachignore`/`.gitignore` are never self-ignored, so an
+  agent can't edit them mid-session to shrink the gate's view; `guard diff` surfaces the gate's
+  blind spots (conventional build/dependency roots) explicitly. A file the *authorized command
+  itself* generates (a refreshed `Cargo.lock`) is attributed as tool-generated and doesn't trip
+  the gate — only the agent's own out-of-scope edits do. Without a sandbox Tach still can't
+  *prevent* a write — it is an honest detect-and-reject gate: the violation lands in
+  `events.jsonl` and the commit is blocked.
 - **Real commands, real receipts.** Each required command runs as a real process with a fixed
   cwd, a scrubbed environment (secrets in the parent env never reach the child), a timeout that
   kills the whole process group on overrun (so a runaway and its children can't outlive it),
@@ -317,11 +325,19 @@ What Tach guarantees across a session:
   [receipt](#3-effects-are-first-class). `tach guard verify` reports `verified: true` only
   when every required command passed and nothing out-of-scope changed — the one bit the agent
   is told never to claim "done" without.
-- **Crash-safe and replayable.** A receipt is keyed by the command *and a digest of the tree
-  it ran against*, so a crashed-then-re-run `verify` over an unchanged tree reuses the proof
-  instead of re-running, while an edited tree correctly re-runs. `tach goal replay <id>`
-  re-derives the verdict from the recorded receipts without re-executing; `--rerun` actually
-  re-runs and compares.
+- **Crash-safe, durable, and replayable.** A receipt is keyed by the command *and a digest of the
+  tree it ran against*, so a crashed-then-re-run `verify` over an unchanged tree reuses the proof
+  instead of re-running, while an edited tree correctly re-runs. Durable writes are `fsync`'d
+  (file then directory), so the guarantee survives a power loss or kernel panic, not just a clean
+  process exit. `tach goal replay <id>` re-derives the verdict from the recorded receipts without
+  re-executing; `--rerun` actually re-runs and compares.
+- **Tamper-evident and auditable.** The event log is a SHA-256 hash chain, so editing, inserting,
+  removing, or reordering any event breaks every link after it. `tach guard audit` re-derives a
+  run's integrity from outside the agent — the chain, each receipt's anchoring and untampered
+  input hash, and whether the recorded `verified` bit is actually supported by the receipts — and
+  exits non-zero if anything was forged. With no sandbox an agent with `.tach/` write access can
+  still *corrupt* its own ledger; what it can't do is forge a self-consistent one. Detection, not
+  prevention, is the guarantee here.
 
 Nondeterministic evidence (stdout bytes, durations, exit timing) lives in receipts and
 artifacts; the control-flow event log stays deterministic — the same separation the action
@@ -465,6 +481,7 @@ The result is a single static binary. Put `target/release/tach` on your `PATH`.
 | `tach guard diff` | Changed files since the baseline, classified by `fs.write` scope (`--json`) |
 | `tach guard verify` | Run the goal's required commands for real; set the `verified` bit (`--rerun`) |
 | `tach guard finalize` / `abort` | Finalize verified changes into Tach's ledger (ledger-only, never git; `commit` is an alias), or cancel the session |
+| `tach guard audit` | Verify a run's ledger is untampered — hash chain, receipt anchoring, and the `verified` bit (`--json`; exits non-zero if forged) |
 | `tach check [file]` | Type- and effect-check; `--json` for the machine view |
 | `tach run [file]` | Run the project's `main` |
 | `tach test [filter]` | Run tests (blocked while the project has errors) |
@@ -489,7 +506,7 @@ The result is a single static binary. Put `target/release/tach` on your `PATH`.
 | `tach goal receipt <id> <rcpt>` | Show one receipt in full (`--json`) |
 | `tach doctor` | Hermetic health check of the toolchain + workspace |
 | `tach explain <code>` | Long-form explanation of a diagnostic code |
-| `tach schema [name]` | Print a versioned JSON schema for any machine output — `diagnostic`, `patch`, `event`, `goal`, `run`, `approval`, `receipt`, `bench`, `test`, and the guard packets `guard-context`, `guard-status`, `guard-diff`, `guard-verify`, `guard-commit` |
+| `tach schema [name]` | Print a versioned JSON schema for any machine output — `diagnostic`, `patch`, `event`, `goal`, `run`, `approval`, `receipt`, `bench`, `test`, and the guard packets `guard-context`, `guard-status`, `guard-diff`, `guard-verify`, `guard-commit`, `guard-audit` |
 
 ## A taste of the language
 
@@ -582,15 +599,19 @@ approvals. **The plan language is real:** a `plan { ... }` block (`let`/`call`/`
 approval gate) and `RetryFlakyDeploy` (a `while` retry loop). Its **durable re-execution interpreter**
 re-walks the plan on every run and resume and memoizes completed calls by receipt, so loops and
 crashes still produce each effect exactly once, and `tach goal replay` reproduces the run. Durable
-writes are atomic (temp file, then rename), so a crash mid-write can't strand a half-written receipt
-that a resume would read as "not yet done." There's a pluggable coder seam
-(`tach fix --coder fixture`) whose proposals still go through the exact same pipeline; `tach fmt`
-gives one canonical, idempotent style; `tach schema` publishes versioned JSON schemas for every
-machine output (including `approval` and `receipt`); and `tach doctor` / `tach explain` round out
-the toolchain. **125 passing tests** plus end-to-end checks (red→green, crash→resume→replay, the
-approval/refund/receipt demo, the loop/approval/crash plan demo, a user-authored plan goal
-that resumes off its source snapshot, and the coding harness adopting a real repo and rejecting
-an out-of-scope edit) and a schema-validation step in CI.
+writes are atomic **and** durable — staged to a `.tmp`, `fsync`'d, `rename`d, and the directory
+`fsync`'d — so a crash mid-write can't strand a half-written receipt that a resume would read as
+"not yet done," and the guarantee holds across a power loss, not just a clean process exit. The
+event log is a SHA-256 hash chain (`tach.event.v2`), so a tampered or forged history is detectable
+(`tach guard audit`); content hashing in the scope gate is cryptographic for the same reason. There's
+a pluggable coder seam (`tach fix --coder fixture`) whose proposals still go through the exact same
+pipeline; `tach fmt` gives one canonical, idempotent style; `tach schema` publishes versioned JSON
+schemas for every machine output (including `approval`, `receipt`, and `guard-audit`); and
+`tach doctor` / `tach explain` round out the toolchain. **151 passing tests** plus end-to-end checks
+(red→green, crash→resume→replay, the approval/refund/receipt demo, the loop/approval/crash plan demo,
+a user-authored plan goal that resumes off its source snapshot, the coding harness adopting a real
+repo and rejecting an out-of-scope edit, power-loss torn-write recovery, and ledger tamper-detection)
+and a schema-validation step in CI.
 
 **Near-term follow-ups (the roadmap the runtime is built for):** real tool integrations behind
 the fake-tool seam, typed memory lanes with a context-drift detector, MCP client/server, and a
@@ -611,7 +632,7 @@ model-free, so everything is fully reproducible offline.
 ## Testing
 
 ```console
-$ cargo test                   # unit + integration tests (125)
+$ cargo test                   # unit + integration tests (151)
 $ bash scripts/e2e.sh          # new → check → fix → test demo, asserts green
 $ bash scripts/goal_e2e.sh     # goal run → crash → resume → replay, asserts no repeated work
 $ bash scripts/action_e2e.sh   # approve → crash → resume → replay, asserts exactly one refund

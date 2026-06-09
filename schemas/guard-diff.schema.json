@@ -2,9 +2,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://tach.dev/schemas/guard-diff.schema.json",
   "title": "Tach Guard Diff",
-  "description": "The classified difference between a guard session's baseline (taken at `begin`) and the current working tree (`tach guard diff --json`). `added`/`modified`/`deleted` are the raw change sets; every changed path is then partitioned into `in_scope` or `out_of_scope` against the goal's fs.write authority. `rejected` is true when any path is out of scope — the same condition that blocks `verify` and `commit`.",
+  "description": "The classified difference between a guard session's baseline (taken at `begin`) and the current working tree (`tach guard diff --json`). `added`/`modified`/`deleted` are the raw change sets; every changed path is then partitioned into `in_scope` or `out_of_scope` against the goal's fs.write authority. `rejected` is true when any path is out of scope — the same condition that blocks `verify` and `commit`. `blind_spots` lists the ignore patterns in effect (frozen at begin), so the gate's uncovered areas are explicit.",
   "type": "object",
-  "required": ["added", "modified", "deleted", "in_scope", "out_of_scope", "rejected"],
+  "required": ["added", "modified", "deleted", "in_scope", "out_of_scope", "rejected", "blind_spots"],
   "additionalProperties": false,
   "properties": {
     "added": { "type": "array", "items": { "type": "string" }, "description": "Repo-relative paths present in the tree but not the baseline." },
@@ -12,6 +12,7 @@
     "deleted": { "type": "array", "items": { "type": "string" }, "description": "Paths present in the baseline but gone from the tree." },
     "in_scope": { "type": "array", "items": { "type": "string" }, "description": "Changed paths that fall inside the goal's fs.write scope." },
     "out_of_scope": { "type": "array", "items": { "type": "string" }, "description": "Changed paths outside the goal's fs.write scope — these block commit." },
-    "rejected": { "type": "boolean", "description": "True when at least one changed file is out of scope." }
+    "rejected": { "type": "boolean", "description": "True when at least one changed file is out of scope." },
+    "blind_spots": { "type": "array", "items": { "type": "string" }, "description": "Ignore patterns in effect for this run (frozen at begin) — conventional build/dependency roots the gate does not watch." }
   }
 }

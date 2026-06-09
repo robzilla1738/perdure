@@ -44,18 +44,19 @@ byte-for-byte.
 | `patch` | `Workspace`, `Edit`, `Patch`, the verify pipeline, call-graph impact analysis, glob scoping |
 | `agent` | the `fix` loop, the optional `Coder` seam (default off), speculative `race`, the suite benchmark, the agent-era `Metrics`, and the shared repair leaves (`collect_problems`, `pick_candidate`, `build_patch`) the goal runtime reuses |
 | `goal` | the resolved `GoalSpec` (budget, authority, success conditions), decoupled from spans so it serializes into the store |
-| `event` | the `tach.event.v1` envelope and the append-only JSONL `EventLog` |
-| `store` | the durable goal store: `goal.json`, `state.json`, `events.jsonl`, `checkpoints/`, `approvals/`, `receipts/` (each receipt self-describing — run/step/effect/input-hash/approval/recording-event), the deterministic source `fingerprint`, canonical idempotency/approval ids, **atomic writes** (temp-file + rename), and unique run-id allocation |
+| `event` | the `tach.event.v2` envelope (a SHA-256 **hash chain** — `prev_hash`/`entry_hash`), the append-only JSONL `EventLog` with `fsync`'d, torn-tail-recoverable appends, and `verify_chain` |
+| `hash` | a dependency-free, NIST-vector-tested **SHA-256** — the cryptographic digest used wherever a hash must resist a crafted collision (scope-gate content hashes, receipt `input_hash`, the event chain); FNV-1a stays for non-security addressing ids |
+| `store` | the durable goal store: `goal.json`, `state.json`, `events.jsonl`, `checkpoints/`, `approvals/`, `receipts/` (each receipt self-describing — run/step/effect/input-hash/approval/recording-event), the deterministic source `fingerprint`, canonical idempotency/approval ids, **atomic + durable writes** (temp-file → `fsync` → rename → dir-`fsync`), a per-run advisory `RunLock`, and unique run-id allocation |
 | `runtime` | the durable executor — `step_once`/`drive` (the repair loop), the action layer's `drive_actions` (a fixed plan with approval gates and receipts), and the plan language's `drive_plan` (durable re-execution of a `plan` block); `resolve_plan` re-parses a user goal's frozen source snapshot on resume (catalog for built-ins); `resume_run`/`replay_run` dispatch on `GoalRecord.kind` |
 | `action` | the linear action layer: the `ActionPlan` model, the offline deterministic **fake tools** (`invoke_fake_tool`), and the built-in goal catalog (`ResolveDuplicateCharge`, `ShipHotfixPR`) |
 | `plan` | the **plan language**: the pure expression evaluator (AST `Expr` → JSON value) and the built-in plan-goal catalog (`ReconcileChargebacks`, `RetryFlakyDeploy`); user-authored plan goals run the same interpreter from a workspace `plan` block. The durable interpreter and `check::check_plan_goal` (the `tach goal check` linter) live in `runtime`/`check` |
 | `fmt` | the one canonical formatter — a precedence-aware, idempotent AST pretty-printer (goals included) |
-| `schema` | versioned JSON Schemas for every machine output, embedded and served by `tach schema` (the goal-runtime packets **and** the guard packets `guard-context`/`status`/`diff`/`verify`/`commit`) |
+| `schema` | versioned JSON Schemas for every machine output, embedded and served by `tach schema` (the goal-runtime packets **and** the guard packets `guard-context`/`status`/`diff`/`verify`/`commit`/`audit`) |
 | `trace` | persist/load `fix`/`race` runs to `.tach/trace.json` (the per-goal history lives in the store) |
 | `adopt` | `tach init --existing`: adopt an existing repo — detect its test command (cargo / npm / bun / pnpm / yarn / go / pytest), write `Tachfile`, `TACH_AGENT.md`, `.tachignore`, and leave the source (and any existing `AGENTS.md`) untouched |
-| `snapshot` | filesystem baselines and the scope gate: a content-hashed `Manifest` of the working tree (kind, content hash, exec bit, symlink target), the hard-exclude (`.git`/`.tach`) and soft-ignore (`target/`, `node_modules/`) rules, and the `diff` that classifies each change as in- or out-of-scope against the goal's `fs.write` globs |
+| `snapshot` | filesystem baselines and the scope gate: a **SHA-256**-content-hashed `Manifest` of the working tree (kind, content hash, exec bit, symlink target), the hard-exclude (`.git`/`.tach`) and soft-ignore (`target/`, `node_modules/`) rules with `.tachignore`/`.gitignore` never self-ignored, the begin-time-frozen ignore set, and the `diff` that classifies each change as in- or out-of-scope against the goal's `fs.write` globs |
 | `shell` | the **one** place Tach spawns a real process: tokenize-not-shell argv, fixed cwd, a scrubbed env allowlist, a bounded timeout that kills the whole process group, and stdout/stderr drained to artifact files on their own threads. Knows nothing about the store — it returns mechanics the caller turns into a receipt |
-| `guard` | the coding-agent session state machine: `begin`/`status`/`context`/`diff`/`verify`/`finalize`(`commit`)/`abort` over a real repo, with crash-injection points for the e2e — receipts keyed by command + tree digest, so a crashed-then-resumed `verify` reuses the proof and the command runs exactly once |
+| `guard` | the coding-agent session state machine: `begin`/`status`/`context`/`diff`/`verify`/`finalize`(`commit`)/`abort`/`audit` over a real repo, with crash-injection points for the e2e — receipts keyed by command + tree digest, so a crashed-then-resumed `verify` reuses the proof and the command runs exactly once; `audit` re-derives ledger integrity (chain + receipts + verified bit) for an operator |
 | `render` / `term` | pretty, colored human output (JSON is the machine path) |
 | `project` / `cli` | file discovery, scaffolding, suite loading, the command dispatcher |
 
@@ -167,17 +168,34 @@ exactly as it was; the durable state lives entirely under `.tach/goals/<run_id>/
 .tach/goals/<run_id>/
   goal.json               the resolved GoalSpec + the base source snapshot
   state.json              the mutable RunState head (status, step, metrics)
-  events.jsonl            append-only history (one tach.event.v1 per line)
+  events.jsonl            append-only, hash-chained history (one tach.event.v2 per line)
   checkpoints/<step>.json a workspace snapshot taken after each step (repair runs)
   approvals/<id>.json     a human approval gate on an effect (action + plan runs)
   receipts/<id>.json      durable proof an effect ran exactly once (action + plan runs)
+  baseline.json           the begin-time tree manifest (coding runs)
+  baseline-ignore.json    the begin-time ignore set, frozen (coding runs)
+  lock                    a per-run advisory lock (flock on unix); held during an op
 ```
 
 For action and plan runs the durable truth is the `approvals/` and `receipts/` dirs (plus the
-event log); `state.json` is a cosmetic head. All durable writes are **atomic** — staged to a
-sibling `.tmp` file and `rename`d into place — so a crash mid-write can never leave a half-written
-receipt that `list_receipts` would silently skip and a resume would mistake for "not yet done"
-(which would re-run the effect). The rename is the commit; a leftover `.tmp` is harmless.
+event log); `state.json` is a cosmetic head. All durable writes are **atomic and durable** —
+staged to a sibling `.tmp` file, `fsync`'d, `rename`d into place, and the parent directory then
+`fsync`'d. Atomicity (the `rename`) means a reader never sees a half-written record; durability
+(the `fsync`s) means both the bytes and the rename survive a power loss or kernel panic, not only
+a clean process exit — so a crash mid-write can never strand a torn receipt that `list_receipts`
+would skip and a resume would mistake for "not yet done" (which would re-run the effect). The
+event log appends one `fsync`'d line per event; an append interrupted by a crash leaves a final
+line with no trailing newline, which `EventLog::resume` recognizes and truncates (a torn tail is
+recoverable, while any *interior* corruption blocks). The rename is the commit; a leftover `.tmp`
+is harmless.
+
+The event log is a **hash chain**: each event carries `prev_hash` (the previous event's hash) and
+`entry_hash` (SHA-256 over its own canonical content). Editing, inserting, removing, or reordering
+any event breaks every link after it, so the "append-only history" is *tamper-evident*, not merely
+append-only by convention. `event::verify_chain` (surfaced as `tach guard audit`) re-derives the
+chain; an agent with `.tach/` write access can still corrupt its ledger, but cannot forge a valid
+one without inverting SHA-256. A per-run `lock` (an `flock` advisory lock on unix, auto-released on
+process exit) keeps two concurrent invocations from driving the same run at once.
 
 ## The action layer (`action` + `runtime::drive_actions`)
 
@@ -329,15 +347,22 @@ guard finalize       finalize ONLY if verified — into Tach's ledger, never git
 guard abort          cancel the session
 ```
 
-Three properties carry it, each a re-use of an existing mechanism rather than new trust:
+Four properties carry it, each a re-use of an existing mechanism rather than new trust:
 
 - **The scope gate is the authority model, on a real filesystem.** `snapshot::diff` compares
   the live tree to the baseline `Manifest` and classifies every change against the goal's
   `fs.write` globs — the same `allowed_writes` authority the goal runtime enforces on typed
   patches. Without a sandbox Tach can't *prevent* an out-of-scope write, so this is an honest
   **detect-and-reject** gate: the violation is recorded in `events.jsonl` and `verify`/`finalize`
-  refuse. The manifest hashes content, exec bit, and symlink target, and *tracks* dotdirs like
-  `.github/` (only `.git`/`.tach` are hard-excluded), so a CI-config edit can't slip the gate.
+  refuse. The manifest hashes content (**SHA-256**, so a change can't be crafted to collide with
+  the baseline), exec bit, and symlink target, and *tracks* dotdirs like `.github/` (only
+  `.git`/`.tach` are hard-excluded), so a CI-config edit can't slip the gate. The ignore set is
+  **frozen at `begin`** (stored as `baseline-ignore.json`) and `.tachignore`/`.gitignore` are
+  never self-ignored, so an agent can't edit them mid-session to shrink the gate's view; `guard
+  diff` surfaces the remaining blind spots (build/dependency roots) explicitly. A file the
+  *authorized command itself* generates is attributed tool-generated (verify's pre-command gate
+  already proved the agent's edits are in scope, so anything out-of-scope post-command is the
+  command's output) and doesn't trip `commit`.
 
 - **Real commands produce durable receipts.** `verify` runs each required command through
   `shell` — the single audited process gate: argv is tokenized (no `/bin/sh -c`, so the
@@ -351,9 +376,19 @@ Three properties carry it, each a re-use of an existing mechanism rather than ne
 - **Crash-safe and replayable, for free.** A verify receipt is keyed by the command **and a
   digest of the tree it ran against**, so a crashed-then-resumed `verify` over an unchanged
   tree finds the receipt and reuses the verdict instead of re-running, while an edited tree
-  correctly re-runs. `tach goal replay <id>` re-derives the verdict from the recorded receipts;
-  `--rerun` actually re-executes and compares. `finalize` writes only under
-  `.tach/goals/<run_id>/` — the git working tree is never touched.
+  correctly re-runs. Receipts are `fsync`'d, so reuse survives a power loss, not just a clean
+  exit. `tach goal replay <id>` re-derives the verdict from the recorded receipts; `--rerun`
+  actually re-executes and compares. `finalize` writes only under `.tach/goals/<run_id>/` — the
+  git working tree is never touched.
+
+- **Tamper-evident, for an operator outside the agent.** The whole ledger lives in `.tach/`,
+  which the agent can write — so Tach cannot *prevent* forgery, only make it *detectable*. The
+  event log is a SHA-256 hash chain; receipts carry an `input_hash` and are anchored to a
+  `receipt.created` event; the `verified` bit is checkable against the receipts that support it.
+  `tach guard audit` re-derives all three and exits non-zero on any break — the trust boundary is
+  a human or CI running it from outside the agent. **True prevention needs an out-of-process
+  authority** holding the ledger beyond the agent's reach; that is the roadmap's `tach serve-mcp`,
+  and it is the one guarantee this in-repo design deliberately cannot make.
 
 ## Why an interpreter (for now)
 

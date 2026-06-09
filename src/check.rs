@@ -948,7 +948,20 @@ fn non_exhaustive_diag(
     .with_strategies(&["add_arm"])
     .with_note("a match must cover every variant, or use a `_` catch-all arm");
     if let Some(patch) = insert_arm_patch(unit, arms, missing) {
-        diag = diag.with_patch(patch);
+        // Unlike the other mechanical fixes, this one's body is a *placeholder*: it
+        // reuses the first arm's expression because that is the only generically
+        // type-correct value available, so the patch makes the match compile and
+        // exhaustive but does NOT synthesize the right behavior for the new variant.
+        // Flag it unmistakably for whoever (human or agent) reads this diagnostic.
+        // (The verify pipeline is a backstop: a placeholder that regresses a test is
+        // rejected, so the loop never greens on a wrong body a test actually covers.)
+        diag = diag
+            .with_note(
+                "the inserted arm body is a PLACEHOLDER (the first arm's value) — it \
+                 compiles but is almost certainly wrong for the new variant; replace \
+                 each placeholder body before relying on it",
+            )
+            .with_patch(patch);
     }
     diag
 }

@@ -2,12 +2,12 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://tach.dev/schemas/event.schema.json",
   "title": "Tach Goal Event",
-  "description": "One immutable entry in a goal run's append-only history (events.jsonl). Each line of the log is one event. Carries a logical sequence number rather than a wall clock, so deterministic runs produce byte-identical logs.",
+  "description": "One immutable, tamper-evident entry in a goal run's append-only history (events.jsonl). Each line of the log is one event. Carries a logical sequence number rather than a wall clock (so deterministic runs chain identically) and a SHA-256 hash chain (prev_hash/entry_hash) so any edit, insertion, removal, or reorder is detectable by `tach guard audit`.",
   "type": "object",
-  "required": ["schema", "event_id", "run_id", "seq", "kind", "timestamp_mode", "payload"],
+  "required": ["schema", "event_id", "run_id", "seq", "kind", "timestamp_mode", "payload", "prev_hash", "entry_hash"],
   "additionalProperties": false,
   "properties": {
-    "schema": { "const": "tach.event.v1" },
+    "schema": { "const": "tach.event.v2" },
     "event_id": { "type": "string", "description": "Stable id derived from seq, e.g. evt_000007." },
     "run_id": { "type": "string" },
     "seq": { "type": "integer", "minimum": 1, "description": "Monotonic sequence number within the run." },
@@ -25,6 +25,8 @@
       ]
     },
     "timestamp_mode": { "type": "string", "enum": ["deterministic", "wallclock"] },
-    "payload": { "type": "object", "description": "Kind-specific structured detail." }
+    "payload": { "type": "object", "description": "Kind-specific structured detail." },
+    "prev_hash": { "type": "string", "description": "The entry_hash of the previous event, or 'genesis' for the first. Links the chain." },
+    "entry_hash": { "type": "string", "description": "SHA-256 (hex) over this event's canonical content excluding entry_hash itself. Self-authenticating." }
   }
 }

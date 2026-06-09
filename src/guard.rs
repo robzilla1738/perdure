@@ -22,7 +22,7 @@
 //! command. The key folds in a digest of the working tree, so an *edited* tree
 //! correctly yields a fresh run rather than a stale reuse.
 
-use crate::event::{kind, read_all, EventLog};
+use crate::event::{kind, read_all, verify_chain, EventLog};
 use crate::goal::{self, GoalSpec};
 use crate::patch::glob_match;
 use crate::project;
@@ -95,6 +95,12 @@ pub struct GuardDiff {
     pub out_of_scope: Vec<String>,
     /// True when at least one changed file is outside the goal's `fs.write` scope.
     pub rejected: bool,
+    /// The ignore patterns in effect for this run — the gate's **blind spots**, frozen
+    /// at `begin`. A write under any of these (e.g. `target/`, `node_modules/`) is not
+    /// watched, by design (they are conventional, git-ignored build/dependency roots).
+    /// Surfaced so an operator can see exactly what the gate does and does not cover,
+    /// rather than trusting an implicit list.
+    pub blind_spots: Vec<String>,
 }
 
 /// The outcome of `commit`/`abort`.
@@ -105,6 +111,25 @@ pub struct GuardOutcome {
     pub reason: Option<String>,
     pub status: String,
     pub phase: String,
+}
+
+/// The ledger-integrity report (`guard audit`) — the operator's trust anchor. Tach
+/// cannot *prevent* an agent with write access to `.tach/` from rewriting its own
+/// history (there is no sandbox); this proves whether it did.
+#[derive(Serialize)]
+pub struct AuditReport {
+    pub run_id: String,
+    /// True iff all three checks pass: the chain is intact, receipts are anchored and
+    /// untampered, and the recorded `verified` bit matches what the receipts support.
+    pub ok: bool,
+    pub events_total: usize,
+    pub chain_ok: bool,
+    pub chain_detail: String,
+    pub receipts_total: usize,
+    pub receipts_ok: bool,
+    pub receipts_detail: String,
+    pub state_consistent: bool,
+    pub state_detail: String,
 }
 
 // ----- begin -----
@@ -193,7 +218,13 @@ pub fn begin(repo: &Path, goal_name: Option<&str>) -> io::Result<RunState> {
     };
     store::save_goal(repo, &run_id, &record)?;
 
-    let baseline = snapshot::snapshot(repo, &Ignore::load(repo))?;
+    // Resolve the ignore set ONCE, here, and freeze it into the run. Every later
+    // scope diff reconstructs it from this snapshot rather than re-reading a live
+    // `.tachignore`, so the gate's blind spots are fixed at `begin` and an agent can't
+    // edit `.tachignore` mid-session to hide an out-of-scope write.
+    let ignore = Ignore::load(repo);
+    store::save_baseline_ignore(repo, &run_id, ignore.globs())?;
+    let baseline = snapshot::snapshot(repo, &ignore)?;
     store::save_baseline(repo, &run_id, &baseline)?;
 
     let mut log = EventLog::create(&store::events_path(repo, &run_id), &run_id)?;
@@ -242,6 +273,16 @@ fn session(repo: &Path, run_id: &str) -> io::Result<(GoalRecord, RunState)> {
     Ok((record, state))
 }
 
+/// The ignore set a run **froze** at `begin`. The blind spots are fixed for the whole
+/// session, so an agent editing `.tachignore` mid-session cannot change what the gate
+/// sees. Falls back to a live load only for runs begun before the freeze shipped.
+fn frozen_ignore(repo: &Path, run_id: &str) -> Ignore {
+    match store::load_baseline_ignore(repo, run_id) {
+        Ok(globs) => Ignore::from_globs(globs),
+        Err(_) => Ignore::load(repo),
+    }
+}
+
 /// Snapshot the head and classify every changed file against the goal's write
 /// scope. Returns the raw diff plus (in_scope, out_of_scope) partitions.
 fn scope_diff(
@@ -250,7 +291,7 @@ fn scope_diff(
     spec: &GoalSpec,
 ) -> io::Result<(Manifest, snapshot::Diff, Vec<String>, Vec<String>)> {
     let baseline = store::load_baseline(repo, run_id)?;
-    let head = snapshot::snapshot(repo, &Ignore::load(repo))?;
+    let head = snapshot::snapshot(repo, &frozen_ignore(repo, run_id))?;
     let diff = snapshot::diff(&baseline, &head);
     let writes = spec.allowed_writes();
     // For a guard session, the goal *must* declare `fs.write` (enforced at
@@ -405,7 +446,20 @@ pub fn diff(repo: &Path, run_id: &str) -> io::Result<GuardDiff> {
         rejected: !out_of_scope.is_empty(),
         in_scope,
         out_of_scope,
+        blind_spots: blind_spots(repo, run_id),
     })
+}
+
+/// The base ignore patterns in effect for a run — the gate's blind spots, surfaced for
+/// `guard diff`. Derived from the frozen ignore set, dropping the expanded `entry/**`
+/// twin of each pattern so the list reads as the roots an operator actually configured.
+fn blind_spots(repo: &Path, run_id: &str) -> Vec<String> {
+    frozen_ignore(repo, run_id)
+        .globs()
+        .iter()
+        .filter(|g| !g.ends_with("/**"))
+        .cloned()
+        .collect()
 }
 
 // ----- verify -----
@@ -423,8 +477,21 @@ pub fn verify_inner(
     crash: Option<GuardCrash>,
 ) -> io::Result<GuardStatus> {
     let (record, mut state) = session(repo, run_id)?;
+    // Hold the run lock across the whole verify: it runs real commands, and two
+    // concurrent verifies could both pass the receipt's "not yet run" check and invoke
+    // the command twice before either receipt lands.
+    let _lock = store::RunLock::acquire(repo, run_id)?;
     let spec = &record.spec;
-    let (head, _diff, _in_scope, out_of_scope) = scope_diff(repo, run_id, spec)?;
+    let (head, _diff, _in_scope, raw_out) = scope_diff(repo, run_id, spec)?;
+    // Exclude files a *prior* verify's authorized command generated (recorded in
+    // `tool_generated`): a refreshed `Cargo.lock` left by an earlier run must not read
+    // as a fresh agent violation on the next verify, or a tree-mutating command could
+    // only ever be verified once. Advisory and audit-backed, exactly like `commit`:
+    // `state` is forgeable, but a forged `tool_generated` is exposed by `guard audit`.
+    let out_of_scope: Vec<String> = raw_out
+        .into_iter()
+        .filter(|p| !state.tool_generated.contains(p))
+        .collect();
     let mut log = EventLog::resume(&store::events_path(repo, run_id), run_id)?;
 
     // Scope gate: an out-of-scope edit blocks the whole verify before any command
@@ -558,14 +625,27 @@ pub fn verify_inner(
     state.verified = !required.is_empty() && passed == required.len() && failures.is_empty();
     if state.verified {
         state.guard_phase = "verified".into();
-        state.verified_digest = digest;
+        // Re-classify the *post-command* tree. verify's pre-command gate above already
+        // proved the agent made no out-of-scope edit (else we'd have returned early),
+        // so anything out-of-scope now is the authorized command's own output — a
+        // refreshed `Cargo.lock`, build artifacts. Record it as tool-generated and
+        // anchor verified_digest to the post-command tree, so `commit` finalizes the
+        // exact state verify certified without re-flagging the command's work.
+        let (post, _pd, _pin, tool_generated) = scope_diff(repo, run_id, spec)?;
+        state.verified_digest = manifest_digest(&post);
+        state.tool_generated = tool_generated.clone();
         log.append(
             kind::VERIFY_PASSED,
-            json!({ "commands": required, "summary": format!("{passed} command(s) passed") }),
+            json!({
+                "commands": required,
+                "summary": format!("{passed} command(s) passed"),
+                "tool_generated": tool_generated,
+            }),
         )?;
     } else {
         state.guard_phase = "open".into();
         state.verified_digest = String::new();
+        state.tool_generated = Vec::new();
         log.append(
             kind::VERIFY_FAILED,
             json!({ "reason": "command_failed", "summary": failures.join("; ") }),
@@ -579,26 +659,9 @@ pub fn verify_inner(
 
 pub fn commit(repo: &Path, run_id: &str) -> io::Result<GuardOutcome> {
     let (record, mut state) = session(repo, run_id)?;
+    let _lock = store::RunLock::acquire(repo, run_id)?;
     let spec = &record.spec;
     let mut log = EventLog::resume(&store::events_path(repo, run_id), run_id)?;
-
-    // Re-check scope at commit (the agent may have edited after verify).
-    let (head, _diff, _in_scope, out_of_scope) = scope_diff(repo, run_id, spec)?;
-    if !out_of_scope.is_empty() {
-        for path in &out_of_scope {
-            log.append(
-                kind::SCOPE_VIOLATION,
-                scope_violation(&head, path, &spec.allow.fs_write),
-            )?;
-        }
-        state.out_of_scope = out_of_scope.len();
-        store::save_state(repo, &state)?;
-        return Ok(refuse(
-            run_id,
-            &state,
-            format!("out-of-scope writes present: {}", out_of_scope.join(", ")),
-        ));
-    }
 
     if !state.verified {
         return Ok(refuse(
@@ -607,12 +670,46 @@ pub fn commit(repo: &Path, run_id: &str) -> io::Result<GuardOutcome> {
             "not verified — run `tach guard verify` first".into(),
         ));
     }
-    // The verified bit is only trustworthy if the tree is unchanged since verify.
+
+    // The verified bit is trustworthy iff the tree is byte-identical to what verify
+    // certified. That single digest check is *stronger* than re-running the scope gate
+    // here: verify's pre-command gate already proved the agent's edits are all in
+    // scope, and `verified_digest` captures the post-command tree — so a file the
+    // authorized command generated (a refreshed `Cargo.lock`) is part of the certified
+    // state and must not re-trip the gate, while *any* post-verify edit, in scope or
+    // out, shifts the digest and is caught here.
+    let head = snapshot::snapshot(repo, &frozen_ignore(repo, run_id))?;
     if manifest_digest(&head) != state.verified_digest {
+        // Something changed since verify. Re-classify to give a precise reason,
+        // ignoring the command-generated set (a genuine post-verify *agent* edit is
+        // what shifted the digest, and that is what we name).
+        let (_h, _d, _in, out) = scope_diff(repo, run_id, spec)?;
+        let agent_out: Vec<String> = out
+            .into_iter()
+            .filter(|p| !state.tool_generated.contains(p))
+            .collect();
+        if agent_out.is_empty() {
+            return Ok(refuse(
+                run_id,
+                &state,
+                "tree changed since verify — run `tach guard verify` again".into(),
+            ));
+        }
+        for path in &agent_out {
+            log.append(
+                kind::SCOPE_VIOLATION,
+                scope_violation(&head, path, &spec.allow.fs_write),
+            )?;
+        }
+        state.out_of_scope = agent_out.len();
+        store::save_state(repo, &state)?;
         return Ok(refuse(
             run_id,
             &state,
-            "tree changed since verify — run `tach guard verify` again".into(),
+            format!(
+                "out-of-scope writes present since verify: {}",
+                agent_out.join(", ")
+            ),
         ));
     }
 
@@ -676,8 +773,9 @@ pub fn replay(repo: &Path, run_id: &str, rerun: bool) -> io::Result<crate::runti
 
     if rerun {
         // Re-run the required commands against the current tree and re-derive the
-        // verdict. Honest reproduction — minted fresh, compared to the record.
-        let head = snapshot::snapshot(repo, &Ignore::load(repo))?;
+        // verdict. Honest reproduction — minted fresh, compared to the record. Use the
+        // run's frozen ignore set so the digest matches what verify recorded.
+        let head = snapshot::snapshot(repo, &frozen_ignore(repo, run_id))?;
         let digest = manifest_digest(&head);
         let mut passed = 0usize;
         for cmd in spec.required_commands() {
@@ -746,6 +844,168 @@ pub fn replay(repo: &Path, run_id: &str, rerun: bool) -> io::Result<crate::runti
         replayed_status,
         identical: consistent,
         steps: recorded.step,
+    })
+}
+
+// ----- audit (ledger integrity) -----
+
+/// Audit a guard run's durable ledger for tampering. Three independent checks, each
+/// resting on a cryptographic hash an agent cannot forge without inverting SHA-256:
+///
+///   1. **Chain** — every event self-authenticates (its `entry_hash` recomputes) and
+///      links to its predecessor; any edit, insertion, removal, or reorder shows.
+///   2. **Receipts** — each receipt's `input_hash` recomputes (untampered) and is
+///      anchored to a `receipt.created` event *in the verified chain* (so a forged
+///      receipt file with no matching chain event is caught, and a chain event whose
+///      receipt file was deleted is caught too).
+///   3. **State** — the recorded `verified` bit matches the verdict the receipts
+///      actually support, so a hand-edited `state.json: verified=true` is exposed.
+///
+/// This is detection, not prevention: with no sandbox an agent *can* rewrite files in
+/// `.tach/`, but it cannot produce a self-consistent forgery. The trust boundary is an
+/// operator (human or CI) running this from outside the agent.
+pub fn audit(repo: &Path, run_id: &str) -> io::Result<AuditReport> {
+    let (record, state) = session(repo, run_id)?;
+    let spec = &record.spec;
+
+    // 1. Parse the log raw so an unparseable line is a *finding*, not a read error,
+    //    then verify the hash chain over what parsed.
+    let raw = std::fs::read_to_string(store::events_path(repo, run_id)).unwrap_or_default();
+    let mut events = Vec::new();
+    let mut parse_fault = None;
+    for (i, line) in raw.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<crate::event::Event>(line) {
+            Ok(e) => events.push(e),
+            Err(e) => {
+                parse_fault = Some(format!("unparseable event at line {}: {e}", i + 1));
+                break;
+            }
+        }
+    }
+    let (chain_ok, chain_detail) = match parse_fault {
+        Some(f) => (false, f),
+        None => match verify_chain(&events) {
+            Ok(()) => (
+                true,
+                format!("intact — {} event(s), chain unbroken", events.len()),
+            ),
+            Err(b) => (
+                false,
+                format!(
+                    "BROKEN at event #{} (seq {}): {}",
+                    b.index + 1,
+                    b.seq,
+                    b.reason
+                ),
+            ),
+        },
+    };
+
+    // 2 & 3. Receipts anchored + untampered, and the `verified` bit consistent.
+    let (receipts_total, receipts_ok, receipts_detail, state_consistent, state_detail) =
+        match store::list_receipts_strict(repo, run_id) {
+            Err(e) => (
+                0,
+                false,
+                format!("unreadable receipt: {e}"),
+                false,
+                "cannot derive a verdict from unreadable receipts".to_string(),
+            ),
+            Ok(rs) => {
+                // Receipt ids the chain says were legitimately created.
+                let created: BTreeMap<String, ()> = events
+                    .iter()
+                    .filter(|e| e.kind == kind::RECEIPT_CREATED)
+                    .filter_map(|e| {
+                        e.payload
+                            .get("receipt_id")
+                            .and_then(|v| v.as_str())
+                            .map(|rid| (rid.to_string(), ()))
+                    })
+                    .collect();
+                let mut faults = Vec::new();
+                for r in &rs {
+                    let expect = store::input_hash(&r.input);
+                    if !r.input_hash.is_empty() && r.input_hash != expect {
+                        faults.push(format!(
+                            "{}: input_hash mismatch — the receipt input was altered",
+                            r.receipt_id
+                        ));
+                    }
+                    if chain_ok && !created.contains_key(&r.receipt_id) {
+                        faults.push(format!(
+                            "{}: not anchored to any receipt.created event — forged receipt",
+                            r.receipt_id
+                        ));
+                    }
+                }
+                if chain_ok {
+                    let have: std::collections::BTreeSet<&str> =
+                        rs.iter().map(|r| r.receipt_id.as_str()).collect();
+                    for rid in created.keys() {
+                        if !have.contains(rid.as_str()) {
+                            faults.push(format!(
+                                "{rid}: chain records this receipt but the file is gone — deleted receipt"
+                            ));
+                        }
+                    }
+                }
+                let receipts_ok = faults.is_empty();
+                let receipts_detail = if receipts_ok {
+                    format!("{} receipt(s) anchored and untampered", rs.len())
+                } else {
+                    faults.join("; ")
+                };
+
+                // Derive the verified verdict from the receipts and compare to the
+                // recorded bit — a forged `verified=true` has no receipts to support it.
+                let required = spec.required_commands();
+                let passed = required
+                    .iter()
+                    .filter(|cmd| {
+                        rs.iter()
+                            .filter(|r| {
+                                r.input.get("command").and_then(|v| v.as_str())
+                                    == Some(cmd.as_str())
+                            })
+                            .any(receipt_passed)
+                    })
+                    .count();
+                let derived =
+                    !required.is_empty() && passed == required.len() && state.out_of_scope == 0;
+                let state_consistent = derived == state.verified;
+                let state_detail = if state_consistent {
+                    format!("recorded verified={} matches the receipts", state.verified)
+                } else {
+                    format!(
+                        "recorded verified={} but the receipts support verified={} — forged verified bit",
+                        state.verified, derived
+                    )
+                };
+                (
+                    rs.len(),
+                    receipts_ok,
+                    receipts_detail,
+                    state_consistent,
+                    state_detail,
+                )
+            }
+        };
+
+    Ok(AuditReport {
+        run_id: run_id.to_string(),
+        ok: chain_ok && receipts_ok && state_consistent,
+        events_total: events.len(),
+        chain_ok,
+        chain_detail,
+        receipts_total,
+        receipts_ok,
+        receipts_detail,
+        state_consistent,
+        state_detail,
     })
 }
 
@@ -842,6 +1102,89 @@ mod tests {
     }
 
     #[test]
+    fn audit_certifies_intact_ledger_and_detects_chain_and_receipt_tampering() {
+        let r = TempRepo::new("audit");
+        scaffold(&r, true); // fixed tree → verify passes, a real receipt is minted
+        let id = begin(r.path(), Some("FixFailingTests")).unwrap().run_id;
+        assert!(verify(r.path(), &id, false).unwrap().verified);
+        assert!(commit(r.path(), &id).unwrap().ok);
+
+        // An untouched ledger audits clean on all three checks.
+        let rep = audit(r.path(), &id).unwrap();
+        assert!(
+            rep.ok,
+            "intact ledger must audit ok — chain: {} | receipts: {} | state: {}",
+            rep.chain_detail, rep.receipts_detail, rep.state_detail
+        );
+        assert!(rep.chain_ok && rep.receipts_ok && rep.state_consistent);
+        assert!(rep.receipts_total >= 1);
+
+        // Tamper 1: edit an event in events.jsonl (same length, valid JSON) — the
+        // hash chain must catch it.
+        let ev_path = store::events_path(r.path(), &id);
+        let original = fs::read_to_string(&ev_path).unwrap();
+        assert!(original.contains("verify.passed"));
+        fs::write(
+            &ev_path,
+            original.replacen("verify.passed", "verify.spoofed", 1),
+        )
+        .unwrap();
+        let rep = audit(r.path(), &id).unwrap();
+        assert!(
+            !rep.ok && !rep.chain_ok,
+            "an edited event must break the chain"
+        );
+
+        // Restore, and confirm the ledger is clean again before the next vector.
+        fs::write(&ev_path, &original).unwrap();
+        assert!(
+            audit(r.path(), &id).unwrap().ok,
+            "restoring the log re-cleans it"
+        );
+
+        // Tamper 2: delete a receipt file the chain still records — caught as a
+        // deleted receipt (the creation event has no surviving file).
+        let rid = store::list_receipts(r.path(), &id)[0].receipt_id.clone();
+        fs::remove_file(
+            store::run_dir(r.path(), &id)
+                .join("receipts")
+                .join(format!("{rid}.json")),
+        )
+        .unwrap();
+        let rep = audit(r.path(), &id).unwrap();
+        assert!(
+            !rep.ok && !rep.receipts_ok,
+            "a deleted receipt must be detected: {}",
+            rep.receipts_detail
+        );
+    }
+
+    #[test]
+    fn audit_detects_a_forged_verified_bit() {
+        // The classic forgery: a broken run whose `state.json` is hand-edited to claim
+        // verified=true. No passing receipt supports it, so audit exposes it.
+        let r = TempRepo::new("forge");
+        scaffold(&r, false); // broken → verify fails, the command receipt is a failure
+        let id = begin(r.path(), Some("FixFailingTests")).unwrap().run_id;
+        assert!(!verify(r.path(), &id, false).unwrap().verified);
+
+        let mut st = store::load_state(r.path(), &id).unwrap();
+        st.verified = true;
+        st.guard_phase = "verified".into();
+        store::save_state(r.path(), &st).unwrap();
+
+        let rep = audit(r.path(), &id).unwrap();
+        assert!(
+            !rep.ok && !rep.state_consistent,
+            "a forged verified bit must be exposed: {}",
+            rep.state_detail
+        );
+        // The chain itself was untouched, so that check still passes — the forgery is
+        // localized to state.json, exactly where audit points.
+        assert!(rep.chain_ok, "the event chain was not touched");
+    }
+
+    #[test]
     fn out_of_scope_edit_is_rejected() {
         let r = TempRepo::new("scope");
         scaffold(&r, true);
@@ -876,6 +1219,125 @@ mod tests {
         assert!(!out.ok, "out-of-scope CI edit must block commit");
         let events = read_all(&store::events_path(r.path(), &id)).unwrap();
         assert!(events.iter().any(|e| e.kind == kind::SCOPE_VIOLATION));
+    }
+
+    #[test]
+    fn editing_tachignore_cannot_hide_an_out_of_scope_write() {
+        // The adversarial bypass: an agent creates an out-of-scope file AND adds it to
+        // `.tachignore` to slip it past the gate. The frozen ignore set (captured at
+        // begin) ignores the live edit, so the file is still seen — and the
+        // `.tachignore` edit is itself visible, never self-hidden.
+        let r = TempRepo::new("frozen");
+        scaffold(&r, true);
+        let id = begin(r.path(), Some("FixFailingTests")).unwrap().run_id;
+        r.write("secret.txt", "exfil\n");
+        r.write(".tachignore", "secret.txt\n.tachignore\n");
+        let d = diff(r.path(), &id).unwrap();
+        assert!(
+            d.out_of_scope.contains(&"secret.txt".to_string()),
+            "frozen ignore must still see the would-be-hidden file: {:?}",
+            d.out_of_scope
+        );
+        assert!(
+            d.out_of_scope.contains(&".tachignore".to_string()),
+            "a .tachignore edit is never self-ignored: {:?}",
+            d.out_of_scope
+        );
+        assert!(d.rejected);
+        // And the blind spots are surfaced, not implicit.
+        assert!(d.blind_spots.contains(&"target".to_string()));
+    }
+
+    #[test]
+    fn command_generated_out_of_scope_file_does_not_block_commit() {
+        // The Cargo.lock sharp edge: the verify command itself writes an out-of-scope
+        // file (a refreshed lockfile). Because verify's pre-command gate already proved
+        // the agent made no out-of-scope edit, the command's output is attributed
+        // tool-generated and must not block commit.
+        let r = TempRepo::new("toolgen");
+        r.write("Cargo.toml", "[package]\nname=\"x\"\n");
+        r.write(
+            "Tachfile",
+            &crate::adopt::coding_goal_source(
+                "FixFailingTests",
+                "sh check.sh",
+                &["src/**".to_string()],
+            ),
+        );
+        r.write(
+            "check.sh",
+            "printf gen > Cargo.lock\ngrep -q FIXED src/lib.rs && exit 0 || exit 1\n",
+        );
+        r.write("src/lib.rs", "// broken\n");
+        let id = begin(r.path(), Some("FixFailingTests")).unwrap().run_id;
+        // The agent fixes the in-scope file (a normal edit).
+        r.write("src/lib.rs", "// FIXED\n");
+
+        let s = verify(r.path(), &id, false).unwrap();
+        assert!(
+            s.verified,
+            "verify passes even though the command writes Cargo.lock"
+        );
+        let st = store::load_state(r.path(), &id).unwrap();
+        assert!(
+            st.tool_generated.contains(&"Cargo.lock".to_string()),
+            "the command's own output is recorded as tool-generated: {:?}",
+            st.tool_generated
+        );
+
+        // A SECOND verify, after another in-scope edit, must also pass: the Cargo.lock
+        // the first command left is now present at the *pre-command* gate and must be
+        // recognized as tool-generated, not flagged as a fresh violation — otherwise a
+        // tree-mutating command could only ever be verified once.
+        r.write("src/lib.rs", "// FIXED again\n");
+        let s2 = verify(r.path(), &id, false).unwrap();
+        assert!(
+            s2.verified,
+            "a re-verify must not flag the prior command's Cargo.lock at the pre-command gate"
+        );
+
+        let out = commit(r.path(), &id).unwrap();
+        assert!(
+            out.ok,
+            "a command-generated lockfile must not block commit: {:?}",
+            out.reason
+        );
+    }
+
+    #[test]
+    fn an_agent_out_of_scope_edit_is_never_laundered_as_tool_generated() {
+        // The adversarial flip side: the agent makes its OWN out-of-scope edit before
+        // verify. verify's pre-command gate catches it, so it can never be masked as
+        // the command's output.
+        let r = TempRepo::new("launder");
+        r.write("Cargo.toml", "[package]\nname=\"x\"\n");
+        r.write(
+            "Tachfile",
+            &crate::adopt::coding_goal_source(
+                "FixFailingTests",
+                "sh check.sh",
+                &["src/**".to_string()],
+            ),
+        );
+        r.write(
+            "check.sh",
+            "printf gen > Cargo.lock\ngrep -q FIXED src/lib.rs && exit 0 || exit 1\n",
+        );
+        r.write("src/lib.rs", "// FIXED\n");
+        let id = begin(r.path(), Some("FixFailingTests")).unwrap().run_id;
+        r.write("EVIL.txt", "agent's own out-of-scope write\n");
+
+        let s = verify(r.path(), &id, false).unwrap();
+        assert!(
+            !s.verified,
+            "an agent out-of-scope edit must fail the pre-command gate"
+        );
+        let st = store::load_state(r.path(), &id).unwrap();
+        assert!(
+            !st.tool_generated.contains(&"EVIL.txt".to_string()),
+            "an agent edit must never be laundered as tool-generated: {:?}",
+            st.tool_generated
+        );
     }
 
     #[test]

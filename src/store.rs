@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 /// The persisted goal record: its contract plus the exact source it started from,
@@ -100,9 +100,19 @@ pub struct RunState {
     /// The tree digest (hash of the head manifest) that the last successful
     /// `verify` validated. `commit` recomputes the digest and refuses if it has
     /// changed — so edits made *after* a green verify can never be committed
-    /// unverified.
+    /// unverified. Anchored to the *post-command* tree, so files the authorized
+    /// command itself produced (a refreshed `Cargo.lock`, build output) are part of
+    /// what was certified and don't re-trip the gate at commit.
     #[serde(default)]
     pub verified_digest: String,
+    /// Out-of-scope paths the *authorized verify command* generated (e.g. a refreshed
+    /// `Cargo.lock`). Because verify's pre-command gate already proved the agent made
+    /// no out-of-scope edit, anything out-of-scope in the post-command tree is the
+    /// command's own output — recorded here so `commit` doesn't mistake the command's
+    /// work for an agent violation. Advisory only: `commit` trusts it solely while the
+    /// tree is byte-identical to `verified_digest`.
+    #[serde(default)]
+    pub tool_generated: Vec<String>,
 }
 
 /// A workspace snapshot taken after a step, enough to resume from exactly here.
@@ -222,16 +232,52 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
         fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".into());
-    // Atomic write: stage to a sibling `.tmp` file, then rename into place.
-    // `fs::write` truncates first, so a crash mid-write would otherwise leave a
-    // half-written receipt/approval/state on disk; `read_dir_json` silently skips
-    // an unparseable file, so a resume would read it as "missing" and re-run the
-    // effect — a double side effect. `rename` is atomic, so a reader only ever
-    // sees the whole old file or the whole new one. A crash can at worst leave a
-    // stale `.tmp` behind, which the next write to the same target overwrites.
+    // Atomic *and durable* write — two distinct guarantees, both required:
+    //
+    //   * Atomicity — stage to a sibling `.tmp`, then `rename` into place. A reader
+    //     (a resume, `list_receipts`) only ever sees the whole old file or the whole
+    //     new one, never a half-written record. Without this a crash mid-write could
+    //     strand a torn receipt that the lossy reader skips as "missing" and a resume
+    //     re-runs — a double side effect.
+    //   * Durability — `fsync` the tmp file's bytes *before* the rename, and `fsync`
+    //     the parent directory *after* it, so both the data and the rename survive a
+    //     power loss or kernel panic, not merely a clean process crash. (A clean
+    //     crash keeps the page cache, so atomicity alone already covered the
+    //     `--crash-after` demos; real durability needs the syncs. The Windows replace
+    //     writes through to disk on its own — see `atomic_replace`.)
+    //
+    // A crash can at worst leave a stale `.tmp` behind, which the next write to the
+    // same target overwrites; the rename is the commit point.
     let tmp = tmp_sibling(path);
-    fs::write(&tmp, json)?;
-    atomic_replace(&tmp, path)
+    write_durable(&tmp, json.as_bytes())?;
+    atomic_replace(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        fsync_dir(parent)?;
+    }
+    Ok(())
+}
+
+/// Write `bytes` to `path` and `fsync` the file (data + metadata) before returning,
+/// so the content is on stable storage — durable across power loss, not just a clean
+/// process crash. The caller renames this staging file into place.
+fn write_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut f = fs::File::create(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()
+}
+
+/// `fsync` a directory so a `rename`/`create` of an entry within it is itself durable
+/// (POSIX requires syncing the directory, not just the file). On non-unix this is a
+/// no-op: the Windows `atomic_replace` uses `MOVEFILE_WRITE_THROUGH`, which already
+/// flushes the change through to disk, and directories are not `fsync`'able the same
+/// way there.
+#[cfg(unix)]
+fn fsync_dir(dir: &Path) -> io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+#[cfg(not(unix))]
+fn fsync_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 /// The deterministic `.tmp` staging path for an atomic write to `path`. No clock
@@ -317,6 +363,25 @@ pub fn save_baseline(repo: &Path, run_id: &str, manifest: &Manifest) -> io::Resu
 
 pub fn load_baseline(repo: &Path, run_id: &str) -> io::Result<Manifest> {
     read_json(&baseline_path(repo, run_id))
+}
+
+fn baseline_ignore_path(repo: &Path, run_id: &str) -> PathBuf {
+    run_dir(repo, run_id).join("baseline-ignore.json")
+}
+
+/// Freeze the ignore globs a coding run resolved at `tach guard begin`, so every later
+/// scope diff classifies against the *same* blind spots. Without this the gate would
+/// re-read a live `.tachignore` on each `verify`/`commit`, and an agent could add a
+/// pattern mid-session to hide an out-of-scope write it had already made.
+pub fn save_baseline_ignore(repo: &Path, run_id: &str, globs: &[String]) -> io::Result<()> {
+    write_json(&baseline_ignore_path(repo, run_id), &globs.to_vec())
+}
+
+/// Load the frozen ignore globs. Runs that predate the freeze return `NotFound`, and
+/// the caller falls back to a live load (back-compat, not a security regression for
+/// any run begun after this shipped).
+pub fn load_baseline_ignore(repo: &Path, run_id: &str) -> io::Result<Vec<String>> {
+    read_json(&baseline_ignore_path(repo, run_id))
 }
 
 pub fn save_checkpoint(repo: &Path, run_id: &str, cp: &Checkpoint) -> io::Result<()> {
@@ -582,6 +647,85 @@ pub fn allocate_run(repo: &Path, fingerprint: &str) -> io::Result<String> {
     ))
 }
 
+// ----- Per-run advisory lock -----
+
+/// An advisory lock over one run directory, so two concurrent `tach` processes can't
+/// drive the same run at once. The receipt spine already makes that *safe* (a second
+/// invoke re-derives the same idempotency key and reuses the receipt) but not *free*:
+/// without a lock, two processes could both pass the "no receipt yet" check and invoke
+/// a tool before either writes — running a real side effect twice. The lock closes
+/// that window.
+///
+/// On unix it is an `flock` advisory lock that the kernel releases when the file
+/// descriptor closes (i.e. on process exit), so a crashed holder never strands a stale
+/// lock. Elsewhere it is a best-effort `create_new` lockfile removed on drop.
+///
+/// Honesty: the lockfile lives in agent-writable `.tach/`, so a determined agent could
+/// delete it. This guards against *accidental* concurrency (two honest invocations) —
+/// it is not, and cannot be, a defense against an adversary with filesystem access.
+pub struct RunLock {
+    #[cfg(unix)]
+    _file: fs::File,
+    #[cfg(not(unix))]
+    path: PathBuf,
+}
+
+impl RunLock {
+    /// Acquire the lock for `run_id`, or fail with `WouldBlock` if another process
+    /// holds it. Held until dropped (or the process exits).
+    pub fn acquire(repo: &Path, run_id: &str) -> io::Result<RunLock> {
+        let dir = run_dir(repo, run_id);
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("lock");
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let file = fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)?;
+            // Non-blocking exclusive advisory lock. Auto-released when `file` (and thus
+            // the fd) drops, including on process exit — so no stale-lock recovery is
+            // ever needed.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("run `{run_id}` is already being operated by another tach process"),
+                ));
+            }
+            Ok(RunLock { _file: file })
+        }
+        #[cfg(not(unix))]
+        {
+            match fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+            {
+                Ok(_) => Ok(RunLock { path }),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "run `{run_id}` appears to be operated by another process \
+                         (remove `{}` if it is stale)",
+                        path.display()
+                    ),
+                )),
+                Err(e) => Err(e),
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl Drop for RunLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 // ----- Deterministic identity for the action layer -----
 //
 // Idempotency keys, approval ids, and receipt ids must be stable functions of
@@ -691,7 +835,11 @@ pub fn receipt_id(idempotency_key: &str) -> String {
 /// Derived from the same canonical bytes as the idempotency key, so it depends only
 /// on the input's content, not its serde key order.
 pub fn input_hash(v: &Value) -> String {
-    format!("ih_{}", fnv1a_hex(&[&canonical_bytes(v)]))
+    // SHA-256, not the FNV mixer below: `input_hash` is integrity/audit metadata on a
+    // receipt, so it must resist a *crafted* collision (two distinct effects forged to
+    // share a hash). The idempotency *key* stays FNV — it is addressing, not
+    // tamper-evidence (re-deriving it on resume is all it must do).
+    format!("ih_{}", crate::hash::sha256_hex(&[&canonical_bytes(v)]))
 }
 
 /// A short stable hex digest of a JSON value, used by fake tools to mint
@@ -745,6 +893,58 @@ mod tests {
         assert_eq!(list_receipts(&repo, run_id).len(), 1);
         assert!(list_receipts_strict(&repo, run_id).is_err());
         assert!(find_receipt_by_key(&repo, run_id, "key1").is_err());
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn durable_write_overwrites_stale_tmp_and_leaves_none_behind() {
+        // A `.tmp` stranded by a hypothetical crash-before-rename must never poison
+        // the next write, and a successful write leaves no staging file behind (the
+        // rename consumes it).
+        let repo = tmp_repo("durable");
+        let run_id = "run_d";
+        let state = RunState {
+            run_id: run_id.into(),
+            step: 1,
+            ..Default::default()
+        };
+        save_state(&repo, &state).unwrap();
+        let p = state_path(&repo, run_id);
+        let tmp = tmp_sibling(&p);
+        fs::write(&tmp, "garbage that must be overwritten").unwrap();
+
+        let mut state2 = state.clone();
+        state2.step = 2;
+        save_state(&repo, &state2).unwrap();
+
+        assert_eq!(
+            load_state(&repo, run_id).unwrap().step,
+            2,
+            "target is the new value"
+        );
+        assert!(
+            !tmp.exists(),
+            "no stale .tmp survives a successful durable write"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn run_lock_is_exclusive_and_releases_on_drop() {
+        let repo = tmp_repo("lock");
+        let run_id = "run_l";
+        let held = RunLock::acquire(&repo, run_id).unwrap();
+        // A second acquire while the first is held is refused (WouldBlock).
+        match RunLock::acquire(&repo, run_id) {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::WouldBlock),
+            Ok(_) => panic!("a held run lock must block a second acquire"),
+        }
+        // Releasing the first lets it be re-acquired.
+        drop(held);
+        assert!(
+            RunLock::acquire(&repo, run_id).is_ok(),
+            "lock must be acquirable again after release"
+        );
         let _ = fs::remove_dir_all(&repo);
     }
 

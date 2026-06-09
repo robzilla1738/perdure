@@ -10,9 +10,10 @@ cargo build --release  # single optimized static binary at target/release/tach
 ## Test
 
 ```console
-cargo test                  # 125 unit/integration tests across the front-end, checker, runtime,
+cargo test                  # 151 unit/integration tests across the front-end, checker, runtime,
                             # patch pipeline, agent loop, goal + action + plan runtime, formatter,
-                            # and the coding harness (guard sessions, snapshots/scope gate, real shell)
+                            # the SHA-256 hash + tamper-evident event chain, and the coding harness
+                            # (guard sessions, frozen scope gate, real shell, ledger audit)
 bash scripts/e2e.sh         # full end-to-end: new → check (expect red) → fix → check/test (green)
 bash scripts/goal_e2e.sh    # goal runtime: run → crash → resume → replay, asserts no repeated work
 bash scripts/action_e2e.sh  # action layer: approve → crash → resume → replay, asserts one refund

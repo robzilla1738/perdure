@@ -85,6 +85,11 @@ pub const SCHEMAS: &[Schema] = &[
         title: "guard commit/abort outcome (`tach guard commit --json`)",
         json: include_str!("../schemas/guard-commit.schema.json"),
     },
+    Schema {
+        name: "guard-audit",
+        title: "guard ledger-integrity audit (`tach guard audit --json`)",
+        json: include_str!("../schemas/guard-audit.schema.json"),
+    },
 ];
 
 /// Look up a schema by name.
@@ -128,7 +133,7 @@ mod tests {
     /// breaks integrators.
     #[test]
     fn guard_schemas_match_emitted_shapes() {
-        use crate::guard::{GuardContext, GuardDiff, GuardOutcome, GuardStatus};
+        use crate::guard::{AuditReport, GuardContext, GuardDiff, GuardOutcome, GuardStatus};
         use serde_json::json;
         use std::collections::BTreeSet;
 
@@ -211,6 +216,7 @@ mod tests {
                 in_scope: vec!["src/lib.rs".into()],
                 out_of_scope: vec![],
                 rejected: false,
+                blind_spots: vec!["target".into(), "node_modules".into()],
             },
         );
 
@@ -222,6 +228,22 @@ mod tests {
                 reason: None,
                 status: "completed".into(),
                 phase: "committed".into(),
+            },
+        );
+
+        assert_parity(
+            "guard-audit",
+            &AuditReport {
+                run_id: "run_x".into(),
+                ok: true,
+                events_total: 12,
+                chain_ok: true,
+                chain_detail: "intact".into(),
+                receipts_total: 1,
+                receipts_ok: true,
+                receipts_detail: "anchored".into(),
+                state_consistent: true,
+                state_detail: "matches".into(),
             },
         );
     }

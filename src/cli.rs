@@ -958,6 +958,7 @@ fn cmd_guard(rest: &[String]) -> i32 {
         // the word "commit" reading as a git commit.
         "finalize" | "commit" => cmd_guard_commit(&rest),
         "abort" => cmd_guard_abort(&rest),
+        "audit" => cmd_guard_audit(&rest),
         "" => {
             print_guard_help();
             0
@@ -997,6 +998,58 @@ fn cmd_guard_begin(rest: &[String]) -> i32 {
                 );
             }
             0
+        }
+        Err(e) => {
+            eprintln!("{} {}", term::bold_red("error:"), e);
+            1
+        }
+    }
+}
+
+/// `tach guard audit` — re-derive the run's ledger integrity from outside the agent.
+/// Exits non-zero if anything is tampered, so an operator or CI can gate on it.
+fn cmd_guard_audit(rest: &[String]) -> i32 {
+    let p = parse(rest, &[]);
+    let root = cwd();
+    let id = match active_or_pos(&p, &root) {
+        Ok(i) => i,
+        Err(c) => return c,
+    };
+    match guard::audit(&root, &id) {
+        Ok(r) => {
+            if p.has("--json") {
+                print_json(&r);
+            } else {
+                let mark = |ok: bool| {
+                    if ok {
+                        term::bold_green("✓")
+                    } else {
+                        term::bold_red("✗")
+                    }
+                };
+                let head = if r.ok {
+                    term::bold_green("● ledger intact")
+                } else {
+                    term::bold_red("● LEDGER TAMPERED")
+                };
+                println!("  {} — {}", head, term::bold(&r.run_id));
+                println!("    {} chain     {}", mark(r.chain_ok), r.chain_detail);
+                println!(
+                    "    {} receipts  {}",
+                    mark(r.receipts_ok),
+                    r.receipts_detail
+                );
+                println!(
+                    "    {} verified  {}",
+                    mark(r.state_consistent),
+                    r.state_detail
+                );
+            }
+            if r.ok {
+                0
+            } else {
+                1
+            }
         }
         Err(e) => {
             eprintln!("{} {}", term::bold_red("error:"), e);
@@ -1076,6 +1129,13 @@ fn cmd_guard_diff(rest: &[String]) -> i32 {
                 }
                 if d.added.is_empty() && d.modified.is_empty() && d.deleted.is_empty() {
                     println!("  {} no changes since the baseline", term::dim("·"));
+                }
+                if !d.blind_spots.is_empty() {
+                    println!(
+                        "  {} unwatched (frozen): {}",
+                        term::dim("·"),
+                        term::dim(&d.blind_spots.join(", "))
+                    );
                 }
             }
             0
@@ -1250,6 +1310,7 @@ fn print_guard_help() {
     println!("  finalize         finalize verified changes into Tach's ledger (never git)");
     println!("  commit           alias for finalize (ledger-only, never git)");
     println!("  abort            cancel the session");
+    println!("  audit [--json]   verify the ledger is untampered (chain + receipts + state)");
 }
 
 /// `tach goal` with no subcommand: list the goals declared in this workspace.
