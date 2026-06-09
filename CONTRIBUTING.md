@@ -10,18 +10,20 @@ cargo build --release  # single optimized static binary at target/release/tach
 ## Test
 
 ```console
-cargo test                  # 98 unit/integration tests across the front-end, checker, runtime,
-                            # patch pipeline, agent loop, goal + action + plan runtime, formatter
+cargo test                  # 125 unit/integration tests across the front-end, checker, runtime,
+                            # patch pipeline, agent loop, goal + action + plan runtime, formatter,
+                            # and the coding harness (guard sessions, snapshots/scope gate, real shell)
 bash scripts/e2e.sh         # full end-to-end: new → check (expect red) → fix → check/test (green)
 bash scripts/goal_e2e.sh    # goal runtime: run → crash → resume → replay, asserts no repeated work
 bash scripts/action_e2e.sh  # action layer: approve → crash → resume → replay, asserts one refund
 bash scripts/plan_e2e.sh    # plan language: loop → per-duplicate approval → mid-loop crash → exactly-once
 bash scripts/user_plan_e2e.sh # user-authored plan goal: scaffold → check → crash → snapshot-beats-live-edit → replay
+bash scripts/guard_e2e.sh   # coding harness: adopt → begin → verify → crash/resume → finalize → out-of-scope reject → replay
 tach fmt --check            # the project's .tach files are in one canonical style
 ```
 
 CI runs all of the above on every push — `cargo fmt --check`, `cargo build`, `cargo test`,
-all five end-to-end scripts (`e2e.sh`, `goal_e2e.sh`, `action_e2e.sh`, `plan_e2e.sh`, `user_plan_e2e.sh`),
+all six end-to-end scripts (`e2e.sh`, `goal_e2e.sh`, `action_e2e.sh`, `plan_e2e.sh`, `user_plan_e2e.sh`, `guard_e2e.sh`),
 `tach fmt --check` over the corpus, and a JSON-schema validation step. See `.github/workflows/ci.yml`.
 
 ## For automated / cloud agents
@@ -55,7 +57,10 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The short version: the front
 (`lexer`/`parser`/`ast`) feeds both the `check`er (which produces patch-carrying
 diagnostics) and the `interp`reter (which runs code and tests). The `patch` pipeline and
 `agent` loop sit on top, the `fmt` module renders the AST back to canonical source, and
-spans are byte offsets so they double as edit coordinates.
+spans are byte offsets so they double as edit coordinates. The `runtime`/`store`/`event`
+modules make that loop durable (goals, checkpoints, receipts, replay), and the coding
+harness (`adopt`/`guard`/`snapshot`/`shell`) turns the same machinery outward onto a real
+repo — `shell` is the one audited place Tach spawns a real process.
 
 ## Conventions
 

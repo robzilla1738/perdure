@@ -50,8 +50,12 @@ byte-for-byte.
 | `action` | the linear action layer: the `ActionPlan` model, the offline deterministic **fake tools** (`invoke_fake_tool`), and the built-in goal catalog (`ResolveDuplicateCharge`, `ShipHotfixPR`) |
 | `plan` | the **plan language**: the pure expression evaluator (AST `Expr` → JSON value) and the built-in plan-goal catalog (`ReconcileChargebacks`, `RetryFlakyDeploy`); user-authored plan goals run the same interpreter from a workspace `plan` block. The durable interpreter and `check::check_plan_goal` (the `tach goal check` linter) live in `runtime`/`check` |
 | `fmt` | the one canonical formatter — a precedence-aware, idempotent AST pretty-printer (goals included) |
-| `schema` | versioned JSON Schemas for every machine output, embedded and served by `tach schema` |
+| `schema` | versioned JSON Schemas for every machine output, embedded and served by `tach schema` (the goal-runtime packets **and** the guard packets `guard-context`/`status`/`diff`/`verify`/`commit`) |
 | `trace` | persist/load `fix`/`race` runs to `.tach/trace.json` (the per-goal history lives in the store) |
+| `adopt` | `tach init --existing`: adopt an existing repo — detect its test command (cargo / npm / bun / pnpm / yarn / go / pytest), write `Tachfile`, `TACH_AGENT.md`, `.tachignore`, and leave the source (and any existing `AGENTS.md`) untouched |
+| `snapshot` | filesystem baselines and the scope gate: a content-hashed `Manifest` of the working tree (kind, content hash, exec bit, symlink target), the hard-exclude (`.git`/`.tach`) and soft-ignore (`target/`, `node_modules/`) rules, and the `diff` that classifies each change as in- or out-of-scope against the goal's `fs.write` globs |
+| `shell` | the **one** place Tach spawns a real process: tokenize-not-shell argv, fixed cwd, a scrubbed env allowlist, a bounded timeout that kills the whole process group, and stdout/stderr drained to artifact files on their own threads. Knows nothing about the store — it returns mechanics the caller turns into a receipt |
+| `guard` | the coding-agent session state machine: `begin`/`status`/`context`/`diff`/`verify`/`finalize`(`commit`)/`abort` over a real repo, with crash-injection points for the e2e — receipts keyed by command + tree digest, so a crashed-then-resumed `verify` reuses the proof and the command runs exactly once |
 | `render` / `term` | pretty, colored human output (JSON is the machine path) |
 | `project` / `cli` | file discovery, scaffolding, suite loading, the command dispatcher |
 
@@ -304,6 +308,52 @@ that authorized it (for a gated effect), and the `created_event_id` of the histo
 recorded it — so a receipt is self-describing for export. These fields are `#[serde(default)]` and
 invisible to replay (which compares only `idempotency_key → output`), so they change nothing about
 reproduction.
+
+## The coding harness (`adopt` + `guard` + `snapshot` + `shell`)
+
+Everything above operates on Tach's own language in an in-memory `Workspace`. The **coding
+harness** turns the same spine — authority scopes, durable receipts, crash/resume, replay —
+outward, onto an *existing* Rust / JS / Go / Python repo edited by an external agent (Claude
+Code, Codex, Cursor). Tach does not do the reasoning; it is the guardrail and the ledger.
+
+`tach init --existing` (`adopt`) detects the repo's test command and writes a `Tachfile` (a
+`goal` in the ordinary grammar, but scoped to a real tree), `TACH_AGENT.md`, and `.tachignore`.
+A session is then a small state machine over the working tree:
+
+```
+guard begin <Goal>   snapshot the tree into a baseline Manifest; open run_<id>; emit guard.opened
+guard context --json the agent's operating contract: allowed files, allowed commands, done bit
+guard diff   --json  snapshot now vs. baseline; classify each change in-/out-of-scope
+guard verify         run each required command for real; capture a receipt; set the verified bit
+guard finalize       finalize ONLY if verified — into Tach's ledger, never git (commit is an alias)
+guard abort          cancel the session
+```
+
+Three properties carry it, each a re-use of an existing mechanism rather than new trust:
+
+- **The scope gate is the authority model, on a real filesystem.** `snapshot::diff` compares
+  the live tree to the baseline `Manifest` and classifies every change against the goal's
+  `fs.write` globs — the same `allowed_writes` authority the goal runtime enforces on typed
+  patches. Without a sandbox Tach can't *prevent* an out-of-scope write, so this is an honest
+  **detect-and-reject** gate: the violation is recorded in `events.jsonl` and `verify`/`finalize`
+  refuse. The manifest hashes content, exec bit, and symlink target, and *tracks* dotdirs like
+  `.github/` (only `.git`/`.tach` are hard-excluded), so a CI-config edit can't slip the gate.
+
+- **Real commands produce durable receipts.** `verify` runs each required command through
+  `shell` — the single audited process gate: argv is tokenized (no `/bin/sh -c`, so the
+  command allowlist is exact), the cwd is pinned to the repo root, the env is scrubbed to a
+  small allowlist (an API key in the parent env never reaches a subprocess or an artifact), a
+  timeout kills the whole process group on overrun, and stdout/stderr stream to artifact files
+  on drain threads (so a chatty `cargo test` can't deadlock by filling a pipe). The exit code
+  becomes a [receipt](#the-store-layout); nondeterministic evidence (bytes, duration, exit
+  timing) lives there, never in the deterministic event log.
+
+- **Crash-safe and replayable, for free.** A verify receipt is keyed by the command **and a
+  digest of the tree it ran against**, so a crashed-then-resumed `verify` over an unchanged
+  tree finds the receipt and reuses the verdict instead of re-running, while an edited tree
+  correctly re-runs. `tach goal replay <id>` re-derives the verdict from the recorded receipts;
+  `--rerun` actually re-executes and compares. `finalize` writes only under
+  `.tach/goals/<run_id>/` — the git working tree is never touched.
 
 ## Why an interpreter (for now)
 

@@ -311,7 +311,8 @@ What Tach guarantees across a session:
   write — it is an honest detect-and-reject gate: the violation lands in `events.jsonl` and
   the commit is blocked.
 - **Real commands, real receipts.** Each required command runs as a real process with a fixed
-  cwd, a scrubbed environment (secrets in the parent env never reach the child), a timeout,
+  cwd, a scrubbed environment (secrets in the parent env never reach the child), a timeout that
+  kills the whole process group on overrun (so a runaway and its children can't outlive it),
   and stdout/stderr captured to artifacts. The exit code becomes a durable
   [receipt](#3-effects-are-first-class). `tach guard verify` reports `verified: true` only
   when every required command passed and nothing out-of-scope changed — the one bit the agent
@@ -586,16 +587,18 @@ that a resume would read as "not yet done." There's a pluggable coder seam
 (`tach fix --coder fixture`) whose proposals still go through the exact same pipeline; `tach fmt`
 gives one canonical, idempotent style; `tach schema` publishes versioned JSON schemas for every
 machine output (including `approval` and `receipt`); and `tach doctor` / `tach explain` round out
-the toolchain. **98 passing tests** plus end-to-end checks (red→green, crash→resume→replay, the
-approval/refund/receipt demo, the loop/approval/crash plan demo, and a user-authored plan goal
-that resumes off its source snapshot) and a schema-validation step in CI.
+the toolchain. **125 passing tests** plus end-to-end checks (red→green, crash→resume→replay, the
+approval/refund/receipt demo, the loop/approval/crash plan demo, a user-authored plan goal
+that resumes off its source snapshot, and the coding harness adopting a real repo and rejecting
+an out-of-scope edit) and a schema-validation step in CI.
 
 **Near-term follow-ups (the roadmap the runtime is built for):** real tool integrations behind
-the fake-tool seam, typed memory lanes with a context-drift detector, an existing-repo `Tachfile`
-mode that wraps Bun/Cargo/Go test commands, MCP client/server, and a portable goal ABI. The event
-log, durable store, authority model, and the approval/receipt substrate are exactly what those
-phases hang off. (User-authored plan goals — write a `plan` block in your own workspace and
-`run`/`check`/`resume`/`replay` it off a source snapshot — already work.) Also: multi-file user
+the fake-tool seam, typed memory lanes with a context-drift detector, MCP client/server, and a
+portable goal ABI. The event log, durable store, authority model, and the approval/receipt
+substrate are exactly what those phases hang off. (User-authored plan goals — a `plan` block in
+your own workspace, `run`/`check`/`resume`/`replay`d off a source snapshot — already work, and so
+does the coding harness: `tach init --existing` adopts a real Cargo/npm/Bun/Go/pytest repo and
+`tach guard` scopes, verifies, and replays an external agent's edits.) Also: multi-file user
 imports and comment-preserving formatting.
 
 **Deliberately scoped out:** native/LLVM codegen (today it interprets), a borrow checker,
@@ -608,15 +611,16 @@ model-free, so everything is fully reproducible offline.
 ## Testing
 
 ```console
-$ cargo test                   # unit + integration tests (98)
+$ cargo test                   # unit + integration tests (125)
 $ bash scripts/e2e.sh          # new → check → fix → test demo, asserts green
 $ bash scripts/goal_e2e.sh     # goal run → crash → resume → replay, asserts no repeated work
 $ bash scripts/action_e2e.sh   # approve → crash → resume → replay, asserts exactly one refund
 $ bash scripts/plan_e2e.sh     # plan loop → per-duplicate approval → mid-loop crash → exactly-once
 $ bash scripts/user_plan_e2e.sh # scaffold → check → crash → snapshot-beats-live-edit → replay
+$ bash scripts/guard_e2e.sh    # coding harness: adopt → verify → crash/resume → finalize → out-of-scope reject → replay
 ```
 
-CI (`.github/workflows/ci.yml`) runs all five on every push, plus `tach fmt --check` and
+CI (`.github/workflows/ci.yml`) runs all six on every push, plus `tach fmt --check` and
 JSON-schema validation. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for notes aimed at
 automated/cloud agents.
 
