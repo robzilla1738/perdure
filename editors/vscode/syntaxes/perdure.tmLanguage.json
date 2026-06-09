@@ -1,0 +1,95 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Perdure",
+  "scopeName": "source.perdure",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#goal-sections" },
+    { "include": "#keywords" },
+    { "include": "#call" },
+    { "include": "#effects" },
+    { "include": "#constants" },
+    { "include": "#types" },
+    { "include": "#functions" }
+  ],
+  "repository": {
+    "comments": {
+      "name": "comment.line.double-slash.perdure",
+      "match": "//.*$"
+    },
+    "strings": {
+      "name": "string.quoted.double.perdure",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.perdure",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "numbers": {
+      "name": "constant.numeric.perdure",
+      "match": "\\b[0-9]+(\\.[0-9]+)?\\b"
+    },
+    "goal-sections": {
+      "comment": "goal sections and the duration shorthand inside budget",
+      "patterns": [
+        {
+          "name": "keyword.control.section.perdure",
+          "match": "\\b(budget|allow|require|plan)\\b(?=\\s*\\{)"
+        },
+        {
+          "name": "constant.numeric.duration.perdure",
+          "match": "\\b[0-9]+[smh]\\b"
+        },
+        {
+          "comment": "authority grants: effect db.read / fs.write / shell.run / http.get",
+          "name": "support.function.authority.perdure",
+          "match": "\\b(effect|fs\\.read|fs\\.write|shell\\.run|http\\.get|http\\.post)\\b"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.perdure",
+          "match": "\\b(if|else|return|match|for|while|in|ensure|approve)\\b"
+        },
+        {
+          "name": "keyword.declaration.perdure",
+          "match": "\\b(fn|let|type|test|goal|import|effects|call)\\b"
+        }
+      ]
+    },
+    "call": {
+      "comment": "the tool name after `call`, e.g. call shell.run { ... }",
+      "match": "\\b(call)\\s+([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)+)",
+      "captures": {
+        "1": { "name": "keyword.declaration.perdure" },
+        "2": { "name": "entity.name.function.tool.perdure" }
+      }
+    },
+    "effects": {
+      "comment": "dotted effect/module members like db.query, time.now",
+      "name": "support.function.builtin.perdure",
+      "match": "\\b(db|time|log|net|math|fake)(\\.[A-Za-z_][A-Za-z0-9_]*)+\\b"
+    },
+    "constants": {
+      "name": "constant.language.perdure",
+      "match": "\\b(true|false|Ok|Err)\\b"
+    },
+    "types": {
+      "comment": "capitalized identifiers are types/variants",
+      "name": "entity.name.type.perdure",
+      "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+    },
+    "functions": {
+      "comment": "a lowercase identifier directly before ( is a call or decl",
+      "name": "entity.name.function.perdure",
+      "match": "\\b[a-z_][A-Za-z0-9_]*(?=\\()"
+    }
+  }
+}

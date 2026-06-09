@@ -1,0 +1,58 @@
+{
+  "name": "perdure",
+  "displayName": "Perdure",
+  "description": "Language support for Perdure (.pdr): syntax highlighting and diagnostics from `perdure check`.",
+  "version": "0.2.0",
+  "publisher": "perdure",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/robzilla1738/perdure"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onLanguage:perdure"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "perdure",
+        "aliases": [
+          "Perdure",
+          "perdure"
+        ],
+        "extensions": [
+          ".pdr"
+        ],
+        "filenames": [
+          "Perdurefile"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "perdure",
+        "scopeName": "source.perdure",
+        "path": "./syntaxes/perdure.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Perdure",
+      "properties": {
+        "perdure.path": {
+          "type": "string",
+          "default": "perdure",
+          "description": "Path to the perdure binary used for diagnostics."
+        }
+      }
+    }
+  }
+}

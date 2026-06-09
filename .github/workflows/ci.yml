@@ -64,6 +64,9 @@ jobs:
       - name: "End-to-end http tools (URL authority → headers_env secrets → Idempotency-Key → zero-request replay)"
         run: bash scripts/http_e2e.sh
 
+      - name: VS Code extension offset mapping (UTF-8 byte spans → UTF-16 positions)
+        run: node editors/vscode/test/offsets.test.js
+
       - name: Perdure format check (corpus)
         run: |
           for d in corpus/*/; do
