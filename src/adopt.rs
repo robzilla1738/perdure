@@ -434,7 +434,8 @@ mod tests {
         // Parses + checks cleanly (no E0431 on the command require form).
         let (prog, pdiags) =
             crate::program::Program::parse_sources(vec![crate::source::SourceFile::new(
-                "Perdurefile", src,
+                "Perdurefile",
+                src,
             )]);
         assert!(pdiags.iter().all(|x| !x.is_error()), "parse: {pdiags:?}");
         let cdiags = crate::check::check_program(&prog);

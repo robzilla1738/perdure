@@ -125,6 +125,11 @@ pub mod kind {
     /// tool is *not* called again. This is the no-duplicate-side-effect guarantee.
     pub const RECEIPT_REUSED: &str = "receipt.reused";
     pub const ACTION_SKIPPED: &str = "action.skipped";
+    /// A real tool call refused by the goal's authority (ungranted command,
+    /// out-of-scope cwd/URL, malformed input) BEFORE any side effect fired. The
+    /// refusal itself is on the ledger; there is deliberately no receipt — a
+    /// receipt is proof an effect happened, and nothing happened.
+    pub const AUTHORITY_DENIED: &str = "authority.denied";
 
     // ----- Coding / guard layer -----
     // A coding goal does not patch toy source or call fake tools; it gates an

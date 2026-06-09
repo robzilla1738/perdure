@@ -58,6 +58,9 @@ jobs:
       - name: End-to-end agent interface (generate AGENTS.md → schema-matched context/next/verify → repairable rejection → finalize ≡ commit)
         run: bash scripts/agent_interface_e2e.sh
 
+      - name: "End-to-end real tools (shell.run in plans: authority refusal → crash → exactly-once → zero-spawn replay)"
+        run: bash scripts/real_shell_e2e.sh
+
       - name: Perdure format check (corpus)
         run: |
           for d in corpus/*/; do

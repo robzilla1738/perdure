@@ -20,6 +20,7 @@ use crate::goal::GoalSpec;
 use crate::patch::{verify_patch, VerifyOpts, Workspace};
 use crate::plan::{self, Env};
 use crate::store::{self, events_path, Approval, Checkpoint, GoalRecord, Receipt, RunState};
+use crate::tool;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io;
@@ -466,6 +467,20 @@ pub fn replay_run(repo: &Path, run_id: &str, rerun: bool) -> io::Result<ReplayRe
         return replay_action_run(repo, run_id);
     }
     if record.kind == "plan" {
+        // `--rerun` re-executes effects; for a plan whose receipts include real
+        // tools that would re-fire them against the world. Refuse loudly —
+        // default replay already proves the run from its receipts.
+        if rerun
+            && store::list_receipts_strict(repo, run_id)?
+                .iter()
+                .any(|r| tool::is_real(&r.tool))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--rerun would re-fire real effects (shell/http receipts exist); \
+                 plan replay always re-walks from receipts instead",
+            ));
+        }
         return replay_plan_run(repo, run_id);
     }
     let recorded = store::load_state(repo, run_id)?;
@@ -1015,6 +1030,11 @@ enum Flow {
     Failed(String),
     /// The step budget (max tool calls) was exceeded.
     Budget,
+    /// The wall-clock budget (`budget { time: … }`) was exceeded: the durations
+    /// already recorded on real-tool receipts sum past the limit, so no further
+    /// real call may fire. Billed from receipts, never a live clock, so the
+    /// same receipts always bill the same on resume and replay.
+    TimeBudget,
     /// A simulated `--crash-after` fired; the durable state is intact, resumable.
     Crash,
 }
@@ -1091,6 +1111,11 @@ struct PlanCtx<'a> {
     /// gates.
     current_gate_id: Option<String>,
     crash: Option<ActionCrash>,
+    /// Wall-clock milliseconds already spent in real tools, summed from receipt
+    /// `duration_ms` (baseline receipts at walk start + this walk's commits).
+    /// Receipt evidence only — never a live clock — so billing is deterministic
+    /// across resume.
+    real_ms_spent: u64,
 }
 
 impl PlanCtx<'_> {
@@ -1242,7 +1267,8 @@ fn exec_call(ctx: &mut PlanCtx, c: &PlanCall) -> io::Result<CallOutcome> {
     let action_id = format!("c{}", ctx.call_index - 1);
 
     // 3. Authority FIRST — a plan can only ever call what `allow` grants.
-    if !ctx.spec.allowed_tools().contains(&c.tool) {
+    //    Fake tools are granted by name; `shell.run` by a non-empty command list.
+    if !tool::tool_granted(ctx.spec, &c.tool) {
         return Ok(CallOutcome::Halt(Flow::Failed(format!(
             "tool `{}` is outside the goal's authority",
             c.tool
@@ -1257,10 +1283,43 @@ fn exec_call(ctx: &mut PlanCtx, c: &PlanCall) -> io::Result<CallOutcome> {
         return Ok(CallOutcome::Output(existing.output));
     }
 
-    // 5. Invoke. The (atomic) receipt write is the commit point; the events are
+    // 5. Real-tool gates, BEFORE anything fires. A refusal is on the ledger
+    //    (authority.denied) but has no receipt: a receipt is proof an effect
+    //    happened, and nothing happened. The wall-clock budget is billed from
+    //    receipt durations, so it too is deterministic on resume.
+    let real = tool::is_real(&c.tool);
+    if real {
+        if let Err(reason) = tool::authorize(ctx.spec, &c.tool, &input) {
+            ctx.log.append(
+                kind::AUTHORITY_DENIED,
+                json!({
+                    "tool": c.tool,
+                    "action": action_id,
+                    "reason": reason,
+                    "input_hash": store::input_hash(&input),
+                }),
+            )?;
+            return Ok(CallOutcome::Halt(Flow::Failed(format!(
+                "call `{}` refused: {}",
+                c.tool, reason
+            ))));
+        }
+        if let Some(limit_ms) = ctx.spec.time_budget_ms() {
+            if ctx.real_ms_spent >= limit_ms {
+                return Ok(CallOutcome::Halt(Flow::TimeBudget));
+            }
+        }
+    }
+
+    // 6. Invoke. The (atomic) receipt write is the commit point; the events are
     //    emitted only AFTER it is durable, so every tool.called in the log has a
     //    receipt and a crash between commit and event-emit costs only an event.
-    match action::invoke_fake_tool(&c.tool, &input) {
+    let invoked = if real {
+        tool::invoke_real(ctx.repo, &ctx.run_id, &key, &c.tool, &input)?
+    } else {
+        action::invoke_fake_tool(&c.tool, &input)
+    };
+    match invoked {
         Ok(output) => {
             let rid = store::receipt_id(&key);
             // The receipt is written BEFORE its events, so it can't read back the
@@ -1292,10 +1351,19 @@ fn exec_call(ctx: &mut PlanCtx, c: &PlanCall) -> io::Result<CallOutcome> {
                 kind::TOOL_CALLED,
                 json!({ "tool": c.tool, "action": action_id, "idempotency_key": key, "input": input }),
             )?;
-            ctx.log.append(
-                kind::TOOL_COMPLETED,
-                json!({ "tool": c.tool, "action": action_id, "output": output }),
-            )?;
+            // Determinism invariant: a real tool's output is nondeterministic
+            // evidence, so the event log records only its hash — the bytes live
+            // on the receipt and in artifacts/. Fake outputs are deterministic
+            // and stay inline (the action-layer e2e contracts depend on them).
+            let completed = if real {
+                json!({ "tool": c.tool, "action": action_id, "output_hash": store::input_hash(&output) })
+            } else {
+                json!({ "tool": c.tool, "action": action_id, "output": output })
+            };
+            ctx.log.append(kind::TOOL_COMPLETED, completed)?;
+            if real {
+                ctx.real_ms_spent += tool::receipt_duration_ms(&output);
+            }
             ctx.log.append(
                 kind::RECEIPT_CREATED,
                 json!({ "receipt_id": rid, "tool": c.tool, "action": action_id, "idempotency_key": key }),
@@ -1395,7 +1463,13 @@ fn drive_plan(
     // baseline, shift every `call_index`, shift every idempotency key, and re-run a
     // completed effect. A damaged proof must block the run, never read as "fewer
     // receipts" — the same posture replay and the event log already take.
-    let baseline = store::list_receipts_strict(repo, &run_id)?.len() as u64;
+    let baseline_receipts = store::list_receipts_strict(repo, &run_id)?;
+    let baseline = baseline_receipts.len() as u64;
+    let real_ms_spent: u64 = baseline_receipts
+        .iter()
+        .filter(|r| tool::is_real(&r.tool))
+        .map(|r| tool::receipt_duration_ms(&r.output))
+        .sum();
     let mut ctx = PlanCtx {
         repo,
         run_id,
@@ -1410,6 +1484,7 @@ fn drive_plan(
         loop_iters: 0,
         current_gate_id: None,
         crash,
+        real_ms_spent,
     };
 
     let flow = exec_stmts(&mut ctx, &plan_block.stmts)?;
@@ -1453,6 +1528,19 @@ fn drive_plan(
             ctx.log.append(
                 kind::BUDGET_EXHAUSTED,
                 json!({ "calls": ctx.call_index, "limit": spec.step_budget() }),
+            )?;
+            ctx.save()?;
+            Ok(action_result(ctx.state, false, false))
+        }
+        Flow::TimeBudget => {
+            ctx.state.status = "budget_exhausted".into();
+            ctx.log.append(
+                kind::BUDGET_EXHAUSTED,
+                json!({
+                    "budget": "time",
+                    "time_spent_ms": ctx.real_ms_spent,
+                    "time_budget_ms": spec.time_budget_ms(),
+                }),
             )?;
             ctx.save()?;
             Ok(action_result(ctx.state, false, false))
@@ -1618,6 +1706,17 @@ struct ReplayCtx<'a> {
     gate_index: u64,
     loop_iters: u64,
     receipts: BTreeMap<String, Value>,
+    /// The recorded run's receipts, keyed by idempotency key. Replay NEVER
+    /// re-invokes a real tool — it feeds these recorded outputs back into the
+    /// walk, proving the plan reproduces the recorded decision sequence from
+    /// the recorded evidence.
+    recorded: &'a BTreeMap<String, Value>,
+    /// Set when the walk reaches a real call with no recorded receipt: the
+    /// frontier where the recorded run stopped. Not a divergence by itself —
+    /// a crashed or failed run legitimately has unexecuted calls ahead of it.
+    frontier: bool,
+    /// Same receipt-evidence billing as the durable walk.
+    real_ms_spent: u64,
 }
 
 fn replay_stmts(ctx: &mut ReplayCtx, stmts: &[PlanStmt]) -> Flow {
@@ -1734,13 +1833,41 @@ fn replay_call(ctx: &mut ReplayCtx, c: &PlanCall) -> Result<Value, Flow> {
         return Err(Flow::Budget);
     }
     let action_id = format!("c{}", ctx.call_index - 1);
-    if !ctx.spec.allowed_tools().contains(&c.tool) {
+    if !tool::tool_granted(ctx.spec, &c.tool) {
         return Err(Flow::Failed(format!(
             "tool `{}` is outside the goal's authority",
             c.tool
         )));
     }
     let key = store::idempotency_key(ctx.run_id, &action_id, &c.tool, &input);
+    if tool::is_real(&c.tool) {
+        // Mirror the durable walk's gates so replay reproduces its decisions —
+        // authorize and the time budget are pure functions of spec + receipts.
+        if let Err(reason) = tool::authorize(ctx.spec, &c.tool, &input) {
+            return Err(Flow::Failed(format!(
+                "call `{}` refused: {}",
+                c.tool, reason
+            )));
+        }
+        if let Some(limit_ms) = ctx.spec.time_budget_ms() {
+            if ctx.real_ms_spent >= limit_ms {
+                return Err(Flow::TimeBudget);
+            }
+        }
+        // NEVER invoke: feed the recorded receipt back in, or stop at the
+        // frontier where the recorded run stopped.
+        return match ctx.recorded.get(&key) {
+            Some(out) => {
+                ctx.real_ms_spent += tool::receipt_duration_ms(out);
+                ctx.receipts.insert(key, out.clone());
+                Ok(out.clone())
+            }
+            None => {
+                ctx.frontier = true;
+                Err(Flow::Crash)
+            }
+        };
+    }
     match action::invoke_fake_tool(&c.tool, &input) {
         Ok(out) => {
             ctx.receipts.insert(key, out.clone());
@@ -1769,18 +1896,46 @@ pub fn replay_plan_run(repo: &Path, run_id: &str) -> io::Result<ReplayResult> {
         gate_index: 0,
         loop_iters: 0,
         receipts: BTreeMap::new(),
+        recorded: &recorded_receipts,
+        frontier: false,
+        real_ms_spent: 0,
     };
-    let status = match replay_stmts(&mut ctx, &plan_block.stmts) {
-        Flow::Next => "completed",
-        Flow::Pause => "awaiting_approval",
-        Flow::Denied(_) => "denied",
-        Flow::Failed(_) => "failed",
-        Flow::Budget => "budget_exhausted",
-        Flow::Crash => "running",
+    let flow = replay_stmts(&mut ctx, &plan_block.stmts);
+    let status = if ctx.frontier {
+        // The walk reached a real call with no recorded receipt: exactly where
+        // the recorded run stopped. The proof is that the plan, fed the
+        // recorded evidence, reproduces the recorded decision sequence — not
+        // that the world's outputs can be re-derived (they can't).
+        "frontier"
+    } else {
+        match flow {
+            Flow::Next => "completed",
+            Flow::Pause => "awaiting_approval",
+            Flow::Denied(_) => "denied",
+            Flow::Failed(_) => "failed",
+            Flow::Budget | Flow::TimeBudget => "budget_exhausted",
+            Flow::Crash => "running",
+        }
     }
     .to_string();
 
-    let identical = status == recorded.status && ctx.receipts == recorded_receipts;
+    // Replay also certifies the ledger itself: a broken hash chain is a
+    // divergence even when the decision walk lines up.
+    let events = crate::event::read_all(&events_path(repo, run_id))?;
+    let chain_ok = crate::event::verify_chain(&events).is_ok();
+
+    let statuses_match = if ctx.frontier {
+        // A frontier is only legitimate for a run that stopped mid-plan; a
+        // recorded `completed` with a missing receipt is tampering, not a
+        // frontier.
+        matches!(
+            recorded.status.as_str(),
+            "running" | "failed" | "budget_exhausted"
+        )
+    } else {
+        status == recorded.status
+    };
+    let identical = chain_ok && statuses_match && ctx.receipts == recorded_receipts;
     Ok(ReplayResult {
         recorded_status: recorded.status,
         replayed_status: status,
@@ -1807,8 +1962,12 @@ mod tests {
         fn new(tag: &str) -> Self {
             static N: AtomicU64 = AtomicU64::new(0);
             let n = N.fetch_add(1, Ordering::Relaxed);
-            let dir =
-                std::env::temp_dir().join(format!("perdure_rt_{}_{}_{}", std::process::id(), tag, n));
+            let dir = std::env::temp_dir().join(format!(
+                "perdure_rt_{}_{}_{}",
+                std::process::id(),
+                tag,
+                n
+            ));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             TempRepo(dir)
@@ -2883,7 +3042,11 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(entries, vec![".perdure".to_string()], "no stray files at root");
+        assert_eq!(
+            entries,
+            vec![".perdure".to_string()],
+            "no stray files at root"
+        );
     }
 
     // ----- user-authored (workspace) plan goals -----
@@ -3073,5 +3236,255 @@ mod tests {
             refund.approval_id.is_some(),
             "the gated refund names its approval"
         );
+    }
+
+    // ===== Real tools in plans (shell.run) ============================
+
+    const REAL_SHELL_SRC: &str = r#"goal RealShell -> Success {
+  budget {
+    steps: 10
+  }
+  allow {
+    shell.run ["sh -c \"echo ran >> marker.txt\"", "sh -c \"echo two >> marker2.txt\""]
+  }
+  plan {
+    let first = call shell.run { cmd: "sh -c \"echo ran >> marker.txt\"" }
+    call shell.run { cmd: "sh -c \"echo two >> marker2.txt\"" }
+  }
+}
+"#;
+
+    fn real_shell_goal() -> (GoalSpec, PlanBlock, BTreeMap<String, String>) {
+        let (spec, plan) = parse_plan_goal(REAL_SHELL_SRC, "RealShell");
+        let base: BTreeMap<String, String> =
+            [("t.pdr".to_string(), REAL_SHELL_SRC.to_string())].into();
+        (spec, plan, base)
+    }
+
+    fn line_count(p: &Path) -> usize {
+        std::fs::read_to_string(p)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn real_shell_call_is_exactly_once_across_crash_and_resume() {
+        let repo = TempRepo::new("real_shell_crash");
+        let (spec, plan, base) = real_shell_goal();
+        let r = start_plan_run(
+            repo.path(),
+            spec,
+            plan,
+            base,
+            Some(ActionCrash::AfterReceipt(1)),
+        )
+        .unwrap();
+        assert!(r.crashed, "crash hook fired after the first receipt");
+        let id = r.state.run_id.clone();
+        assert_eq!(line_count(&repo.path().join("marker.txt")), 1);
+        assert_eq!(line_count(&repo.path().join("marker2.txt")), 0);
+
+        let done = resume_plan_run(repo.path(), &id, None).unwrap();
+        assert_eq!(done.state.status, "completed");
+        assert_eq!(
+            line_count(&repo.path().join("marker.txt")),
+            1,
+            "resume reused the receipt — the finished command never reran"
+        );
+        assert_eq!(line_count(&repo.path().join("marker2.txt")), 1);
+        assert_eq!(receipts_by_tool(repo.path(), &id, "shell.run"), 2);
+    }
+
+    #[test]
+    fn real_tool_events_carry_only_the_output_hash() {
+        let repo = TempRepo::new("real_shell_redact");
+        let (spec, plan, base) = real_shell_goal();
+        let r = start_plan_run(repo.path(), spec, plan, base, None).unwrap();
+        let id = r.state.run_id.clone();
+        assert_eq!(r.state.status, "completed");
+        let events = read_all(&events_path(repo.path(), &id)).unwrap();
+        let completed: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == kind::TOOL_COMPLETED)
+            .collect();
+        assert_eq!(completed.len(), 2);
+        for e in completed {
+            assert!(
+                e.payload.get("output").is_none(),
+                "real output bytes must never land in the event log"
+            );
+            assert!(e.payload.get("output_hash").is_some());
+        }
+        // The receipts DO carry the evidence the events redact.
+        for rcpt in store::list_receipts(repo.path(), &id) {
+            assert!(rcpt.output.get("ok").is_some());
+            assert!(rcpt.output.get("stdout_artifact").is_some());
+        }
+    }
+
+    #[test]
+    fn replay_feeds_receipts_back_and_never_spawns() {
+        let repo = TempRepo::new("real_shell_replay");
+        let (spec, plan, base) = real_shell_goal();
+        let r = start_plan_run(repo.path(), spec, plan, base, None).unwrap();
+        let id = r.state.run_id.clone();
+        assert_eq!(r.state.status, "completed");
+
+        let rep = replay_plan_run(repo.path(), &id).unwrap();
+        assert!(rep.identical, "replay reproduces the recorded run");
+        assert_eq!(rep.replayed_status, "completed");
+        assert_eq!(
+            line_count(&repo.path().join("marker.txt")),
+            1,
+            "replay must not spawn — the marker would have grown"
+        );
+        assert_eq!(line_count(&repo.path().join("marker2.txt")), 1);
+    }
+
+    #[test]
+    fn replay_of_a_crashed_real_run_stops_at_the_frontier() {
+        let repo = TempRepo::new("real_shell_frontier");
+        let (spec, plan, base) = real_shell_goal();
+        let r = start_plan_run(
+            repo.path(),
+            spec,
+            plan,
+            base,
+            Some(ActionCrash::AfterReceipt(1)),
+        )
+        .unwrap();
+        assert!(r.crashed);
+        let id = r.state.run_id.clone();
+
+        let rep = replay_plan_run(repo.path(), &id).unwrap();
+        assert_eq!(rep.replayed_status, "frontier");
+        assert!(
+            rep.identical,
+            "a frontier exactly at the crash point is a faithful replay"
+        );
+        assert_eq!(
+            line_count(&repo.path().join("marker2.txt")),
+            0,
+            "replay never fires the call beyond the frontier"
+        );
+    }
+
+    #[test]
+    fn ungranted_command_is_refused_before_any_spawn() {
+        let src = r#"goal Evil -> Success {
+  budget {
+    steps: 5
+  }
+  allow {
+    shell.run ["true"]
+  }
+  plan {
+    call shell.run { cmd: "sh -c \"echo pwned >> evil.txt\"" }
+  }
+}
+"#;
+        let repo = TempRepo::new("real_shell_denied");
+        let (spec, plan) = parse_plan_goal(src, "Evil");
+        let r = start_plan_run(repo.path(), spec, plan, BTreeMap::new(), None).unwrap();
+        assert_eq!(r.state.status, "failed");
+        let id = r.state.run_id.clone();
+        assert!(
+            !repo.path().join("evil.txt").exists(),
+            "the refused command must never have spawned"
+        );
+        assert_eq!(count_kind(repo.path(), &id, kind::AUTHORITY_DENIED), 1);
+        assert_eq!(
+            store::list_receipts(repo.path(), &id).len(),
+            0,
+            "a refusal is not an effect — no receipt"
+        );
+    }
+
+    #[test]
+    fn nonzero_exit_is_an_ok_false_receipt_the_plan_branches_on() {
+        let src = r#"goal Branchy -> Success {
+  budget {
+    steps: 5
+  }
+  allow {
+    shell.run ["sh -c \"exit 3\"", "sh -c \"echo recovered >> rec.txt\""]
+  }
+  plan {
+    let r = call shell.run { cmd: "sh -c \"exit 3\"" }
+    if !r.ok {
+      call shell.run { cmd: "sh -c \"echo recovered >> rec.txt\"" }
+    }
+  }
+}
+"#;
+        let repo = TempRepo::new("real_shell_branch");
+        let (spec, plan) = parse_plan_goal(src, "Branchy");
+        let r = start_plan_run(repo.path(), spec, plan, BTreeMap::new(), None).unwrap();
+        assert_eq!(
+            r.state.status, "completed",
+            "a failing command is an output to branch on, not a run failure"
+        );
+        let id = r.state.run_id.clone();
+        let receipts = store::list_receipts(repo.path(), &id);
+        assert_eq!(receipts.len(), 2, "the failure itself is receipted");
+        let failed = receipts
+            .iter()
+            .find(|x| x.action_id == "c0")
+            .expect("first call's receipt");
+        assert_eq!(failed.output.get("ok"), Some(&json!(false)));
+        assert_eq!(failed.output.get("exit_code"), Some(&json!(3)));
+        assert_eq!(line_count(&repo.path().join("rec.txt")), 1);
+    }
+
+    #[test]
+    fn spawn_failure_writes_no_receipt_and_fails_the_run() {
+        let src = r#"goal NoBin -> Success {
+  budget {
+    steps: 5
+  }
+  allow {
+    shell.run ["definitely_not_a_real_binary_qz"]
+  }
+  plan {
+    call shell.run { cmd: "definitely_not_a_real_binary_qz" }
+  }
+}
+"#;
+        let repo = TempRepo::new("real_shell_nospawn");
+        let (spec, plan) = parse_plan_goal(src, "NoBin");
+        let r = start_plan_run(repo.path(), spec, plan, BTreeMap::new(), None).unwrap();
+        assert_eq!(r.state.status, "failed");
+        let id = r.state.run_id.clone();
+        assert_eq!(count_kind(repo.path(), &id, kind::TOOL_FAILED), 1);
+        assert_eq!(
+            store::list_receipts(repo.path(), &id).len(),
+            0,
+            "the effect never fired, so a later attempt is safe to re-invoke"
+        );
+    }
+
+    #[test]
+    fn time_budget_zero_blocks_the_first_real_call() {
+        let src = r#"goal NoTime -> Success {
+  budget {
+    steps: 5
+    time: 0s
+  }
+  allow {
+    shell.run ["true"]
+  }
+  plan {
+    call shell.run { cmd: "true" }
+  }
+}
+"#;
+        let repo = TempRepo::new("real_shell_timebudget");
+        let (spec, plan) = parse_plan_goal(src, "NoTime");
+        assert_eq!(spec.time_budget_ms(), Some(0));
+        let r = start_plan_run(repo.path(), spec, plan, BTreeMap::new(), None).unwrap();
+        assert_eq!(r.state.status, "budget_exhausted");
+        let id = r.state.run_id.clone();
+        assert_eq!(store::list_receipts(repo.path(), &id).len(), 0);
+        assert_eq!(count_kind(repo.path(), &id, kind::BUDGET_EXHAUSTED), 1);
     }
 }

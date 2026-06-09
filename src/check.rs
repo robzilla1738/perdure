@@ -212,18 +212,32 @@ pub fn check_plan_goal(g: &GoalDecl, unit: &Unit, diags: &mut Vec<Diagnostic>) {
         Some(p) => p,
         None => return,
     };
-    let granted: BTreeSet<String> = g.allow.tools.iter().cloned().collect();
-    let known: Vec<String> = crate::action::known_tools()
+    let mut granted: BTreeSet<String> = g.allow.tools.iter().cloned().collect();
+    // `shell.run` is granted by a non-empty `allow { shell.run [...] }` command
+    // list, not by name in `tools` — mirror `tool::tool_granted`.
+    if !g.allow.shell.is_empty() {
+        granted.insert("shell.run".into());
+    }
+    let known: Vec<String> = crate::tool::known_tools()
         .iter()
         .map(|s| s.to_string())
         .collect();
     let mut bound: BTreeSet<String> = BTreeSet::new();
-    check_plan_stmts(&plan.stmts, &granted, &known, &mut bound, unit, diags);
+    check_plan_stmts(
+        &plan.stmts,
+        &granted,
+        &g.allow.shell,
+        &known,
+        &mut bound,
+        unit,
+        diags,
+    );
 }
 
 fn check_plan_stmts(
     stmts: &[PlanStmt],
     granted: &BTreeSet<String>,
+    shell: &[String],
     known: &[String],
     bound: &mut BTreeSet<String>,
     unit: &Unit,
@@ -233,7 +247,9 @@ fn check_plan_stmts(
         match s {
             PlanStmt::Let { name, value, .. } => {
                 match value {
-                    PlanValue::Call(c) => check_plan_call(c, granted, known, bound, unit, diags),
+                    PlanValue::Call(c) => {
+                        check_plan_call(c, granted, shell, known, bound, unit, diags)
+                    }
                     PlanValue::Expr(e) => check_plan_expr(e, bound, unit, diags),
                 }
                 // The binding is visible only AFTER its right-hand side (a `let x = x`
@@ -241,18 +257,18 @@ fn check_plan_stmts(
                 bound.insert(name.clone());
             }
             PlanStmt::Call { call, .. } => {
-                check_plan_call(call, granted, known, bound, unit, diags)
+                check_plan_call(call, granted, shell, known, bound, unit, diags)
             }
             PlanStmt::Approve { body, .. } => {
-                check_plan_stmts(body, granted, known, bound, unit, diags)
+                check_plan_stmts(body, granted, shell, known, bound, unit, diags)
             }
             PlanStmt::If {
                 cond, then, els, ..
             } => {
                 check_plan_expr(cond, bound, unit, diags);
-                check_plan_stmts(then, granted, known, bound, unit, diags);
+                check_plan_stmts(then, granted, shell, known, bound, unit, diags);
                 if let Some(els) = els {
-                    check_plan_stmts(els, granted, known, bound, unit, diags);
+                    check_plan_stmts(els, granted, shell, known, bound, unit, diags);
                 }
             }
             PlanStmt::For {
@@ -262,7 +278,7 @@ fn check_plan_stmts(
                 // The loop variable is in scope for the body (and, like the runtime's
                 // flat Env, stays bound afterward — so the checker never over-rejects).
                 bound.insert(var.clone());
-                check_plan_stmts(body, granted, known, bound, unit, diags);
+                check_plan_stmts(body, granted, shell, known, bound, unit, diags);
             }
             PlanStmt::While { cond, body, span } => {
                 check_plan_expr(cond, bound, unit, diags);
@@ -278,7 +294,7 @@ fn check_plan_stmts(
                         .with_note("call a tool inside the loop so each iteration makes durable progress"),
                     );
                 }
-                check_plan_stmts(body, granted, known, bound, unit, diags);
+                check_plan_stmts(body, granted, shell, known, bound, unit, diags);
             }
         }
     }
@@ -287,6 +303,7 @@ fn check_plan_stmts(
 fn check_plan_call(
     c: &PlanCall,
     granted: &BTreeSet<String>,
+    shell: &[String],
     known: &[String],
     bound: &BTreeSet<String>,
     unit: &Unit,
@@ -305,6 +322,11 @@ fn check_plan_call(
         }
         diags.push(d);
     } else if !granted.contains(&c.tool) {
+        let note = if c.tool == "shell.run" {
+            "add `shell.run [\"<command>\"]` to the goal's `allow` block".to_string()
+        } else {
+            format!("add `{}` to the goal's `allow` block", c.tool)
+        };
         diags.push(
             Diagnostic::error(
                 "E0433",
@@ -316,8 +338,33 @@ fn check_plan_call(
                 &unit.source.path,
                 c.tool_span,
             )
-            .with_note(format!("add `{}` to the goal's `allow` block", c.tool)),
+            .with_note(note),
         );
+    } else if c.tool == "shell.run" {
+        // The command allowlist is exact-match; a literal `cmd` not on it will
+        // be refused at runtime (authority.denied), so say it at check time.
+        // Only a literal is checkable — a computed cmd is the runtime's job.
+        if let Some((_, Expr::Str(cmd, span))) = c.input.iter().find(|(k, _)| k == "cmd") {
+            if !shell.iter().any(|s| s == cmd) {
+                diags.push(
+                    Diagnostic::error(
+                        "E0438",
+                        "command_ungranted",
+                        format!("`{cmd}` is not in the goal's `allow {{ shell.run [...] }}` list"),
+                        &unit.source.path,
+                        *span,
+                    )
+                    .with_note(format!(
+                        "allowed commands: {}",
+                        shell
+                            .iter()
+                            .map(|s| format!("`{s}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )),
+                );
+            }
+        }
     }
     for (_, e) in &c.input {
         check_plan_expr(e, bound, unit, diags);
@@ -1838,5 +1885,49 @@ fn compute(x: Int) -> Int {
         // must not fire for a goal that carries a plan block.
         assert!(!plan_diag_kinds(crate::project::PLAN_DEMO_CHARGEBACKS)
             .contains(&"unknown_require_condition".to_string()));
+    }
+
+    #[test]
+    fn shell_run_is_granted_by_a_nonempty_command_list() {
+        // The shell demo template is the canonical exercise: shell.run is not in
+        // `tools`, yet the non-empty command list grants it.
+        let kinds = plan_diag_kinds(crate::project::PLAN_DEMO_SHELL);
+        assert!(
+            !kinds.contains(&"tool_ungranted".to_string())
+                && !kinds.contains(&"unknown_tool".to_string())
+                && !kinds.contains(&"command_ungranted".to_string()),
+            "the shell template must check clean: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn shell_run_without_a_command_list_is_ungranted() {
+        let src = r#"goal G -> Success {
+  budget { steps: 5 }
+  allow { fake.email.send }
+  plan {
+    call shell.run { cmd: "cargo test" }
+  }
+}"#;
+        assert!(plan_diag_kinds(src).contains(&"tool_ungranted".to_string()));
+    }
+
+    #[test]
+    fn literal_command_off_the_allowlist_is_flagged_at_check_time() {
+        let src = r#"goal G -> Success {
+  budget { steps: 5 }
+  allow { shell.run ["cargo test"] }
+  plan {
+    call shell.run { cmd: "rm -rf /" }
+  }
+}"#;
+        let (prog, _) = Program::parse_sources(vec![SourceFile::new("m.pdr", src)]);
+        let diags = check_program(&prog);
+        let d = diags
+            .iter()
+            .find(|d| d.kind == "command_ungranted")
+            .expect("an E0438 command_ungranted error");
+        assert_eq!(d.code, "E0438");
+        assert!(d.is_error());
     }
 }

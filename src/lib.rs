@@ -42,6 +42,7 @@ pub mod span;
 pub mod store;
 pub mod term;
 pub mod token;
+pub mod tool;
 pub mod trace;
 pub mod types;
 pub mod value;

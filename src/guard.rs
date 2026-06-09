@@ -298,7 +298,10 @@ pub fn begin(repo: &Path, goal_name: Option<&str>) -> io::Result<RunState> {
                 let names: Vec<String> = all.iter().map(|g| g.name.clone()).collect();
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("Perdurefile has several goals; name one: {}", names.join(", ")),
+                    format!(
+                        "Perdurefile has several goals; name one: {}",
+                        names.join(", ")
+                    ),
                 ));
             }
         }

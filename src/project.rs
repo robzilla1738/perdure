@@ -127,10 +127,11 @@ pub fn scaffold(
     if let Some(tmpl) = plan_template {
         let src = match tmpl {
             "chargebacks" => PLAN_DEMO_CHARGEBACKS,
+            "shell" => PLAN_DEMO_SHELL,
             other => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("unknown goal template `{other}` (try `chargebacks`)"),
+                    format!("unknown goal template `{other}` (try `chargebacks` or `shell`)"),
                 ))
             }
         };
@@ -274,6 +275,40 @@ pub const PLAN_DEMO_CHARGEBACKS: &str = r#"goal ReconcileLocalDemo -> Success {
           ticket_id: "zd_dispute"
           body: "Reviewed: not a duplicate, no refund."
           public: false
+        }
+      }
+    }
+  }
+}
+"#;
+
+/// A workspace-authored plan goal that runs REAL commands
+/// (`perdure new <name> --goal shell`). The smallest demonstration of the
+/// centerpiece guarantees: the `allow` list is the only authority (an
+/// unlisted command is refused before it spawns), every execution commits a
+/// receipt (crash + resume never reruns a finished command), the follow-up
+/// is gated on human approval, and `goal replay` re-walks the plan from
+/// receipts without spawning anything. Written canonically so `perdure fmt`
+/// is a no-op.
+pub const PLAN_DEMO_SHELL: &str = r#"goal SmokeCheck -> Success {
+  budget {
+    steps: 10
+    time: 15m
+  }
+  allow {
+    shell.run ["echo perdure says hello", "uname"]
+  }
+  require {
+    commands.receipted
+  }
+  plan {
+    let hello = call shell.run {
+      cmd: "echo perdure says hello"
+    }
+    if hello.ok {
+      approve "also record this machine's kernel name" {
+        call shell.run {
+          cmd: "uname"
         }
       }
     }

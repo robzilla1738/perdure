@@ -849,7 +849,9 @@ fn cmd_init(rest: &[String]) -> i32 {
             "{} usage: perdure init --existing [--force]",
             term::bold_red("error:")
         );
-        eprintln!("  adopts the current repo: writes Perdurefile, PERDURE_AGENT.md, .perdureignore");
+        eprintln!(
+            "  adopts the current repo: writes Perdurefile, PERDURE_AGENT.md, .perdureignore"
+        );
         return 2;
     }
     let root = cwd();
@@ -1693,7 +1695,10 @@ fn cmd_goal_check(rest: &[String]) -> i32 {
     let name = match p.pos.first() {
         Some(n) => n.clone(),
         None => {
-            eprintln!("{} usage: perdure goal check <name>", term::bold_red("error:"));
+            eprintln!(
+                "{} usage: perdure goal check <name>",
+                term::bold_red("error:")
+            );
             return 2;
         }
     };
@@ -2145,7 +2150,8 @@ fn cmd_goal_receipts(rest: &[String]) -> i32 {
 
 fn cmd_goal_receipt(rest: &[String]) -> i32 {
     let p = parse(rest, &[]);
-    let (id, rid) = match two_positionals(&p, "perdure goal receipt <run-id> <receipt-id> [--json]") {
+    let (id, rid) = match two_positionals(&p, "perdure goal receipt <run-id> <receipt-id> [--json]")
+    {
         Some(v) => v,
         None => return 2,
     };

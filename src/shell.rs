@@ -347,8 +347,12 @@ mod tests {
         fn new(tag: &str) -> Self {
             static N: AtomicU64 = AtomicU64::new(0);
             let n = N.fetch_add(1, Ordering::Relaxed);
-            let dir =
-                std::env::temp_dir().join(format!("perdure_sh_{}_{}_{}", std::process::id(), tag, n));
+            let dir = std::env::temp_dir().join(format!(
+                "perdure_sh_{}_{}_{}",
+                std::process::id(),
+                tag,
+                n
+            ));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
             TempDir(dir)

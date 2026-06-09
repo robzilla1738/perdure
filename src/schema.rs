@@ -215,7 +215,8 @@ mod tests {
                 forbidden: json!({ "out_of_scope_writes": "rejected at the gate" }),
                 current_failure: None,
                 next_required_action: "edit files in scope, then run `perdure guard verify`".into(),
-                verification_condition: "`perdure guard status --json` reports verified=true".into(),
+                verification_condition: "`perdure guard status --json` reports verified=true"
+                    .into(),
                 done_condition: "verified=true and phase=committed".into(),
                 verified: false,
             },

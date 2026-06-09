@@ -96,6 +96,29 @@ impl GoalSpec {
         self.budget.retries.unwrap_or(DEFAULT_RETRIES)
     }
 
+    /// The run's wall-clock budget in milliseconds, parsed from
+    /// `budget { time: 20m }` (`Ns`/`Nm`/`Nh`). `None` when the goal sets no
+    /// time budget or the text does not parse — an unparseable budget must not
+    /// silently become an infinite one, but goal *validation* is the checker's
+    /// job; the runtime treats it as absent and the recorded text stands.
+    ///
+    /// Billing is deterministic on resume: the runtime sums `duration_ms`
+    /// across existing receipts (durations are receipt evidence, never read
+    /// from a live clock), so the same receipts always bill the same.
+    pub fn time_budget_ms(&self) -> Option<u64> {
+        let text = self.budget.time.as_deref()?.trim();
+        let (num, unit_ms) = if let Some(n) = text.strip_suffix('h') {
+            (n, 3_600_000)
+        } else if let Some(n) = text.strip_suffix('m') {
+            (n, 60_000)
+        } else if let Some(n) = text.strip_suffix('s') {
+            (n, 1_000)
+        } else {
+            return None;
+        };
+        num.trim().parse::<u64>().ok()?.checked_mul(unit_ms)
+    }
+
     /// The exact set of effects this goal is authorized to perform. Always a
     /// concrete set — a goal that lists none is granted none, which is the safe
     /// default: a patch that would perform *any* new effect is then rejected.
@@ -179,4 +202,41 @@ pub fn all_goals(program: &Program) -> Vec<&GoalDecl> {
         }
     }
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec_with_time(time: Option<&str>) -> GoalSpec {
+        GoalSpec {
+            name: "G".into(),
+            success: None,
+            budget: BudgetSpec {
+                time: time.map(|s| s.to_string()),
+                ..BudgetSpec::default()
+            },
+            allow: AllowSpec::default(),
+            require: vec![],
+        }
+    }
+
+    #[test]
+    fn time_budget_parses_seconds_minutes_hours() {
+        assert_eq!(spec_with_time(Some("45s")).time_budget_ms(), Some(45_000));
+        assert_eq!(
+            spec_with_time(Some("20m")).time_budget_ms(),
+            Some(1_200_000)
+        );
+        assert_eq!(spec_with_time(Some("2h")).time_budget_ms(), Some(7_200_000));
+        assert_eq!(spec_with_time(Some("0s")).time_budget_ms(), Some(0));
+    }
+
+    #[test]
+    fn absent_or_unparseable_time_budget_is_none() {
+        assert_eq!(spec_with_time(None).time_budget_ms(), None);
+        assert_eq!(spec_with_time(Some("20")).time_budget_ms(), None);
+        assert_eq!(spec_with_time(Some("soon")).time_budget_ms(), None);
+        assert_eq!(spec_with_time(Some("m")).time_budget_ms(), None);
+    }
 }

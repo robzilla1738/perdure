@@ -714,7 +714,9 @@ impl RunLock {
                 if waited >= LOCK_ACQUIRE_GRACE {
                     return Err(io::Error::new(
                         io::ErrorKind::WouldBlock,
-                        format!("run `{run_id}` is already being operated by another perdure process"),
+                        format!(
+                            "run `{run_id}` is already being operated by another perdure process"
+                        ),
                     ));
                 }
                 std::thread::sleep(step);
@@ -880,8 +882,12 @@ mod tests {
     fn tmp_repo(tag: &str) -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let p =
-            std::env::temp_dir().join(format!("perdure_store_{}_{}_{}", std::process::id(), tag, n));
+        let p = std::env::temp_dir().join(format!(
+            "perdure_store_{}_{}_{}",
+            std::process::id(),
+            tag,
+            n
+        ));
         let _ = fs::remove_dir_all(&p);
         p
     }
